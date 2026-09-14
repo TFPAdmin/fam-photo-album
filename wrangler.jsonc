@@ -1,0 +1,34 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fam-photo-album",
+  "account_id": "33110daa5aadd8df2fc259536b3076f6",
+  "main": "vinext/server/fetch-handler",
+  "compatibility_date": "2026-05-15",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "familyphotoalbum.xyz",
+      "custom_domain": true
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fam-photo-album",
+      "database_id": "2dac0c2c-9f24-4ef2-a509-2e3f86b9faa1",
+      "migrations_dir": "drizzle"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "fam-photo-album"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
