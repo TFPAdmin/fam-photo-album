@@ -38,10 +38,10 @@ After deployment, open the domain, enter `SETUP_KEY`, and create the owner usern
 
 ## Accounts and sharing
 
-- **Owner:** full access to accounts and media; can create admins and members.
+- **Owner:** full access to accounts and media; can create admins and members. The owner account is omitted from the directory returned to admins and members. In All family media, choose a family member to filter their collection.
 - **Admin:** creates member accounts, resets member passwords and enables/disables members. Does not automatically gain access to member media or manage owner/admin credentials.
 - **Member:** manages a private collection and albums. Selects individual family members who may view and download a file. Recipients cannot edit or re-share it through the app.
-- Temporary passwords must be changed at first sign-in. Resetting a password or disabling an account invalidates its sessions.
+- Temporary passwords must be changed at first sign-in. Changing your own password preserves the current session and revokes your other sessions. Admin resets revoke the target member’s sessions while preserving the administrator’s session. Expired or changed accounts return the interface to sign-in rather than leaving stale account controls visible.
 - No public account registration or ChatGPT authentication. Login, password and setup attempts are rate-limited, and writes require the same request origin.
 
 ## Original-file protection
