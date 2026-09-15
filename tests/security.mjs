@@ -12,15 +12,14 @@ try{
  await req('setup',{method:'POST',data:{key:'wrong'},expect:403});
  let r=await req('setup',{method:'POST',data:{key:'test-setup-key',name:'Owner',username:'owner',password:'owner-password-long'}}),owner=cookie(r);const ownerId=(await data(r)).user.id;
  await req('setup',{method:'POST',data:{key:'test-setup-key',name:'Second',username:'second',password:'owner-password-long'},expect:409});
- const people={};for(const [name,role] of [['alice','member'],['bob','member'],['admin','admin']]){await req('members',{cookie:owner,method:'POST',data:{name,username:name,password:'temporary-password',role}});r=await req('login',{method:'POST',data:{username:name,password:'temporary-password'}});let c=cookie(r);const u=(await data(r)).user;await req('media',{cookie:c,expect:403});r=await req('password',{cookie:c,method:'POST',data:{current:'temporary-password',password:name+'-permanent-password'}});people[name]={id:u.id,cookie:cookie(r)||c}}
+ const people={};for(const [name,role] of [['alice','member'],['bob','member'],['admin','admin']]){await req('members',{cookie:owner,method:'POST',data:{name,username:name,password:'temporary-password',role}});r=await req('login',{method:'POST',data:{username:name,password:'temporary-password'}});let c=cookie(r);const u=(await data(r)).user;await req('media',{cookie:c,expect:403});r=await req('password',{cookie:c,method:'POST',data:{current:'temporary-password',password:name+'-permanent-password'}});const rotated=cookie(r);assert.ok(rotated&&rotated!==c);await req('me',{cookie:rotated});r=await req('login',{method:'POST',data:{username:name,password:name+'-permanent-password'}});people[name]={id:u.id,cookie:cookie(r)}}
  const a=people.alice,b=people.bob,ad=people.admin;
  for(const person of [a,ad]){const list=(await data(await req('members',{cookie:person.cookie}))).members;assert.ok(!list.some(m=>m.role==='owner'||m.id===ownerId));}
  assert.ok((await data(await req('members',{cookie:owner}))).members.some(m=>m.id===ownerId));
  await req('members/'+b.id+'/reset',{cookie:owner,method:'POST',headers:{'x-vault-user':a.id},data:{password:'not-applied-password'},expect:409});
  await req('me',{cookie:'theme=light;'+a.cookie+';other=value'});
  const otherSession=cookie(await req('login',{method:'POST',data:{username:'alice',password:'alice-permanent-password'}}));
- await req('password',{cookie:a.cookie,method:'POST',data:{current:'alice-permanent-password',password:'alice-updated-password'}});
- await req('me',{cookie:a.cookie});await req('me',{cookie:otherSession,expect:401});
+ r=await req('password',{cookie:a.cookie,method:'POST',data:{current:'alice-permanent-password',password:'alice-updated-password'}});a.cookie=cookie(r);assert.ok(a.cookie);await req('me',{cookie:a.cookie});await req('me',{cookie:otherSession,expect:401});
 
  await req('members',{cookie:a.cookie,method:'POST',data:{},expect:403});
  await req('members/'+ownerId+'/reset',{cookie:ad.cookie,method:'POST',data:{password:'new-password-long'},expect:403});
@@ -56,7 +55,7 @@ try{
  await req('members/'+b.id+'/reset',{cookie:ad.cookie,method:'POST',data:{password:'new-temporary-password'}});await req('me',{cookie:b.cookie,expect:401});await req('login',{method:'POST',data:{username:'bob',password:'bob-permanent-password'},expect:401});
  await req('me',{cookie:ad.cookie});await req('me',{cookie:owner});
  const resetLogin=await req('login',{method:'POST',data:{username:'bob',password:'new-temporary-password'}});const resetCookie=cookie(resetLogin);assert.equal((await data(resetLogin)).user.mustChange,true);
- await req('password',{cookie:resetCookie,method:'POST',data:{current:'new-temporary-password',password:'bob-final-password'}});await req('media',{cookie:resetCookie});
+ r=await req('password',{cookie:resetCookie,method:'POST',data:{current:'new-temporary-password',password:'bob-final-password'}});const finalCookie=cookie(r);assert.ok(finalCookie&&finalCookie!==resetCookie);await req('me',{cookie:finalCookie});await req('login',{method:'POST',data:{username:'bob',password:'bob-final-password'}});await req('media',{cookie:finalCookie});
  await req('members/'+b.id+'/reset',{cookie:owner,method:'POST',data:{password:'owner-reset-password'}});await req('me',{cookie:owner});await req('me',{cookie:resetCookie,expect:401});
  await req('members/'+a.id+'/access',{cookie:ad.cookie,method:'POST',data:{active:false}});await req('me',{cookie:a.cookie,expect:401});
  console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset and account disable.`);
