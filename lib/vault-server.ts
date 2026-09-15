@@ -14,6 +14,7 @@ function fail(message:string,status=400):never{throw Object.assign(new Error(mes
 function eq(a:string,b:string){if(a.length!==b.length)return false;let d=0;for(let i=0;i<a.length;i++)d|=a.charCodeAt(i)^b.charCodeAt(i);return d===0}
 async function pw(p:string,salt=hex(crypto.getRandomValues(new Uint8Array(16)).buffer)){const k=await crypto.subtle.importKey('raw',encode(p), 'PBKDF2',false,['deriveBits']);return salt+':'+hex(await crypto.subtle.deriveBits({name:'PBKDF2',salt:encode(salt),iterations:100000,hash:'SHA-256'},k,256))}
 function password(p:any){if(typeof p!=='string'||p.length<12||p.length>128)fail('Use a password with 12–128 characters.');return p}
+function forcePasswordChange(value:any){if(value!==undefined&&typeof value!=='boolean')fail('Choose whether a password change is required.');return value===false?0:1}
 const profile=(u:any)=>({id:u.id,username:u.username,name:u.name,role:u.role,mustChange:!!u.must_change,active:!!u.active});
 function json(x:any,status=200,headers:Record<string,string>={}){return Response.json(x,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}})}
 async function throttle(key:string,max:number){const t=now();await stmt('INSERT INTO limits(key,count,reset) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN reset<? THEN 1 ELSE count+1 END, reset=CASE WHEN reset<? THEN excluded.reset ELSE reset END',key,t+900000,t,t).run();const r=await one('SELECT count FROM limits WHERE key=?',key);if(r.count>max)fail('Too many attempts. Try again in 15 minutes.',429)}
@@ -97,8 +98,21 @@ async function route(r:Request):Promise<Response>{
   if(p[1]==='profile'&&method==='POST'){
    const name=typeof b.name==='string'?b.name.trim():'';
    if(!name||name.length>80)fail('Use a display name with 1–80 characters.');
-   await stmt('UPDATE users SET name=? WHERE id=?',name,u.id).run();
-   return json({user:profile({...u,name})});
+   const username=b.username===undefined?u.username:typeof b.username==='string'?b.username.trim().toLowerCase():'';
+   if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');
+   const changed=username!==u.username;
+   if(changed){
+    await throttle('username-change:'+u.id,10);
+    if(typeof b.current!=='string'||b.current.length>128||!eq(await pw(b.current,u.password.split(':')[0]),u.password))fail('Current password is incorrect.');
+   }
+   try{
+    const result=await db().batch([
+     stmt('UPDATE users SET name=?,username=? WHERE id=? AND username=? AND password=? AND active=1 AND must_change=0',name,username,u.id,u.username,u.password),
+     ...(changed?[stmt('DELETE FROM sessions WHERE user_id=? AND token<>? AND EXISTS(SELECT 1 FROM users WHERE id=? AND username=? AND password=?)',u.id,u.session_token,u.id,username,u.password)]:[])
+    ]);
+    if(!result[0].meta.changes)fail('Your account changed. Please sign in again.',401);
+   }catch(e){if(await one('SELECT id FROM users WHERE username=? AND id<>?',username,u.id))fail('That username is already in use.',409);throw e}
+   return json({user:profile({...u,name,username})});
   }
   if(p[1]==='recovery'&&(method==='POST'||method==='DELETE')){
    await throttle('recovery-settings:'+u.id,10);
@@ -118,9 +132,9 @@ async function route(r:Request):Promise<Response>{
  if(p[0]==='members'){
   if(method==='GET')return json({members:await all("SELECT id,username,name,role,active FROM users WHERE (active=1 OR ?=1) AND (role<>'owner' OR ?=1) ORDER BY name COLLATE NOCASE",u.role==='owner'||u.role==='admin'?1:0,u.role==='owner'?1:0)});
   admin(u);const b=await body(r);
-  if(method==='POST'&&!p[1]){const username=String(b.username||'').toLowerCase();if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');const role=u.role==='owner'&&b.role==='admin'?'admin':'member';try{await stmt('INSERT INTO users(id,username,name,password,role,created) VALUES(?,?,?,?,?,?)',id(),username,String(b.name||username).trim().slice(0,80),await pw(password(b.password)),role,now()).run()}catch{fail('That username is already in use.',409)}return json({ok:true})}
+  if(method==='POST'&&!p[1]){const username=String(b.username||'').toLowerCase();if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');const role=u.role==='owner'&&b.role==='admin'?'admin':'member',mustChange=forcePasswordChange(b.mustChange);try{await stmt('INSERT INTO users(id,username,name,password,role,must_change,created) VALUES(?,?,?,?,?,?,?)',id(),username,String(b.name||username).trim().slice(0,80),await pw(password(b.password)),role,mustChange,now()).run()}catch{fail('That username is already in use.',409)}return json({ok:true})}
   const t=await one('SELECT * FROM users WHERE id=?',p[1]);manage(u,t);
-  if(p[2]==='reset'&&method==='POST'){await db().batch([stmt('UPDATE users SET password=?,must_change=1 WHERE id=?',await pw(password(b.password)),t.id),stmt('DELETE FROM sessions WHERE user_id=?',t.id),stmt('DELETE FROM settings WHERE key=?','recovery:'+t.id)]);return json({ok:true})}
+  if(p[2]==='reset'&&method==='POST'){const mustChange=forcePasswordChange(b.mustChange);await db().batch([stmt('UPDATE users SET password=?,must_change=? WHERE id=?',await pw(password(b.password)),mustChange,t.id),stmt('DELETE FROM sessions WHERE user_id=?',t.id),stmt('DELETE FROM settings WHERE key=?','recovery:'+t.id)]);return json({ok:true})}
   if(p[2]==='access'&&method==='POST'){await db().batch([stmt('UPDATE users SET active=? WHERE id=?',b.active?1:0,t.id),stmt('DELETE FROM sessions WHERE user_id=?',t.id)]);return json({ok:true})}
  }
  if(p[0]==='albums'){

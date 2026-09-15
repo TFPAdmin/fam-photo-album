@@ -127,5 +127,41 @@ try{
  for(let i=0;i<6;i++)await recovery('rate-limited-account',badAnswers,{expect:i<5?400:429,headers:{'cf-connecting-ip':'192.0.2.'+(70+i)}});
  // IP throttling also applies across different usernames.
  for(let i=0;i<16;i++)await recovery('rate-account-'+i,badAnswers,{expect:i<15?400:429,headers:{'cf-connecting-ip':'192.0.2.99'}});
+ // Editable usernames preserve identity and recovery; confirmation and uniqueness are enforced.
+ const otherOwnerSession=cookie(await req('login',{method:'POST',data:{username:'owner',password:'recovered-password-long'}}));
+ const editOwner=(username,current='recovered-password-long',expect=200)=>req('account/profile',{cookie:owner,method:'POST',data:{name:'Updated Owner',username,current},expect});
+ await editOwner('owner-renamed','wrong',400);
+ await editOwner('bad username','recovered-password-long',400);
+ await editOwner('ADMIN','recovered-password-long',409);
+ assert.equal((await data(await req('me',{cookie:owner}))).user.name,'Owner');
+ const edited=await data(await editOwner('Owner-Renamed'));
+ assert.equal(edited.user.username,'owner-renamed');assert.equal(edited.user.id,ownerId);assert.equal(edited.user.role,'owner');
+ await req('me',{cookie:otherOwnerSession,expect:401});
+ assert.equal((await data(await req('me',{cookie:owner}))).user.username,'owner-renamed');
+ await req('login',{method:'POST',data:{username:'owner',password:'recovered-password-long'},expect:401});
+ await req('login',{method:'POST',data:{username:'owner-renamed',password:'recovered-password-long'}});
+ assert.equal((await data(await req('account',{cookie:owner}))).recoveryQuestions.length,3);
+ await clearRecoveryLimits();await recovery('owner-renamed');
+ owner=cookie(await req('login',{method:'POST',data:{username:'owner-renamed',password:'recovered-password-long'}}));
+ // Administrators choose forced or direct sign-in on reset; old sessions and recovery are still revoked.
+ await req('members/'+a.id+'/reset',{cookie:ad.cookie,method:'POST',data:{password:'optional-change-password',mustChange:'false'},expect:400});
+ await req('members/'+a.id+'/reset',{cookie:ad.cookie,method:'POST',data:{password:'optional-change-password',mustChange:false}});
+ const noForce=await req('login',{method:'POST',data:{username:'alice',password:'optional-change-password'}}),noForceCookie=cookie(noForce);
+ assert.equal((await data(noForce)).user.mustChange,false);await req('media',{cookie:noForceCookie});
+ await req('account/recovery',{cookie:noForceCookie,method:'POST',data:{current:'optional-change-password',answers}});
+ await req('members/'+a.id+'/reset',{cookie:ad.cookie,method:'POST',data:{password:'required-change-password',mustChange:true}});
+ await req('me',{cookie:noForceCookie,expect:401});
+ assert.equal(await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+a.id).first(),null);
+ const forced=await req('login',{method:'POST',data:{username:'alice',password:'required-change-password'}}),forcedCookie=cookie(forced);
+ assert.equal((await data(forced)).user.mustChange,true);await req('media',{cookie:forcedCookie,expect:403});
+ await req('members/'+ownerId+'/reset',{cookie:ad.cookie,method:'POST',data:{password:'not-allowed-password',mustChange:false},expect:403});
+ await req('members/'+ad.id+'/reset',{cookie:ad.cookie,method:'POST',data:{password:'not-allowed-password',mustChange:false},expect:403});
+ await req('members/'+ad.id+'/reset',{cookie:owner,method:'POST',data:{password:'owner-updated-admin',mustChange:false}});
+ const adminReset=await data(await req('login',{method:'POST',data:{username:'admin',password:'owner-updated-admin'}}));assert.equal(adminReset.user.mustChange,false);
+ // The same choice is available during account creation, with the secure default retained.
+ await req('members',{cookie:owner,method:'POST',data:{name:'Direct',username:'direct',password:'direct-login-password',mustChange:false}});
+ const direct=await req('login',{method:'POST',data:{username:'direct',password:'direct-login-password'}}),directCookie=cookie(direct);
+ assert.equal((await data(direct)).user.mustChange,false);await req('account',{cookie:directCookie});
+ await req('members/'+b.id+'/reset',{cookie:directCookie,method:'POST',data:{password:'not-allowed-password',mustChange:false},expect:403});
  console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset, Account Center, all-role recovery, answer privacy, recovery removal, rate limits and rollback, and account disable.`);
 }finally{await mf.dispose()}
