@@ -274,7 +274,9 @@ try{
  await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,recoveryAction:'replace',answers:replacement}});
  await req('forgot-password',{method:'POST',headers:{'cf-connecting-ip':'192.0.2.208'},data:{username:'doomed-renamed',answers:replacement,password:'final-pass',confirm:'final-pass'}});
  await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,active:false}});
- await req('login',{method:'POST',headers:{'cf-connecting-ip':'192.0.2.207'},data:{username:'doomed-renamed',password:'final-pass'},expect:401});
+ const blockedLogin=await req('login',{method:'POST',headers:{'cf-connecting-ip':'192.0.2.207'},data:{username:'doomed-renamed',password:'final-pass'},expect:403});
+ assert.equal(blockedLogin.headers.get('set-cookie'),null);assert.equal((await data(blockedLogin)).error,'Account disabled. Please contact your family admin.');
+ const wrongBlocked=await req('login',{method:'POST',headers:{'cf-connecting-ip':'192.0.2.207'},data:{username:'doomed-renamed',password:'wrong-password'},expect:401});assert.equal((await data(wrongBlocked)).error,'Username or password is incorrect.');
  await req(managePath,{cookie:owner,method:'POST',data:editPayload});managedCookie=cookie(await logDoomed('doomed-renamed','final-pass'));
  // Actual verified upload, thumbnail, unfinished multipart upload, and >1 deletion batch.
  await req('albums',{cookie:managedCookie,method:'POST',data:{name:'Deletion test'}});

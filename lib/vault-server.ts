@@ -108,7 +108,7 @@ async function route(r:Request):Promise<Response>{
  }
  if(p[0]==='login'&&method==='POST'){
   const b=await body(r),username=String(b.username||'').toLowerCase();await throttle('ip:'+r.headers.get('cf-connecting-ip'),60);await throttle('user:'+username,12);
-  const u=await one('SELECT * FROM users WHERE username=? AND active=1',username);const input=typeof b.password==='string'&&b.password.length<=128?b.password:'';const hash=await pw(input,u?.password.split(':')[0]||'00000000000000000000000000000000');if(!u||!eq(hash,u.password))fail('Username or password is incorrect.',401);return session(u);
+  const u=await one('SELECT * FROM users WHERE username=?',username);const input=typeof b.password==='string'&&b.password.length<=128?b.password:'';const hash=await pw(input,u?.password.split(':')[0]||'00000000000000000000000000000000');if(!u||!eq(hash,u.password))fail('Username or password is incorrect.',401);if(!u.active)fail('Account disabled. Please contact your family admin.',403);return session(u);
  }
  // The former Cloudflare-secret recovery endpoint is intentionally retired.
  if(p[0]==='owner-reset')fail('Not found.',404);
