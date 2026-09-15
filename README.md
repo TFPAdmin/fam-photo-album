@@ -93,3 +93,9 @@ In **Family accounts → Manage account**, the primary admin can edit any Member
 Deletion runs in small batches while the management panel is open. It can be paused or resumed using **Manage account / Resume deletion** after a network interruption. Once started it cannot be undone or re-enabled. Storage deletion must succeed before associated media records are removed. A small non-personal deletion marker keyed by the old account ID is retained to prevent stale requests from recreating data and to make retries safe. Previously downloaded copies and external backups are outside the application’s deletion scope.
 
 Deployment applies `0001_account_deletion_guards.sql` automatically via the existing deploy command. These D1 triggers block in-flight requests from modifying a deleting account or inserting new orphaned records. No additional Cloudflare secrets are required. Multipart cleanup recognizes [R2’s documented missing-upload code](https://developers.cloudflare.com/r2/api/error-codes/) so already-aborted or expired uploads do not block retries; other storage failures pause deletion.
+
+## Upload organization and file names
+
+The upload panel includes **Add uploads to album** with No album and the current member’s albums. It defaults to the album being viewed. Each queued file keeps the album selected when it was added, including retries. **All albums → Not in an album** shows the current user’s verified, non-removed photos and videos whose album is empty.
+
+Open a photo or video to use **File name → Rename file**. The uploader and primary admin can rename it; recipients and regular admins cannot rename another user’s files. The existing extension, stored bytes, storage key, album and shares are preserved. The new name is used in the collection and when downloading.

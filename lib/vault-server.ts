@@ -1,4 +1,5 @@
 import { env } from 'cloudflare:workers';
+import { mediaNameParts } from './media-name';
 import { RECOVERY_QUESTIONS,normalizeAnswer } from './recovery-questions';
 const CHUNK=8*1024*1024;
 const db=()=>{if(!env.DB)throw new Error('Database unavailable');return env.DB};
@@ -265,7 +266,7 @@ async function route(r:Request):Promise<Response>{
   if(view==='family'){if(u.role!=='owner')fail('Primary admin access required.',403);where='m.deleted IS NULL';args=[]}
   const member=url.searchParams.get('member');if(member){if(u.role!=='owner'||view!=='family')fail('This filter is available in the primary admin’s family collection.',403);where+=' AND m.owner=?';args.push(member)}
   if(view==='trash')where='m.owner=? AND m.deleted IS NOT NULL';
-  const album=url.searchParams.get('album');if(album){where+=' AND m.album=?';args.push(album)}
+  const album=url.searchParams.get('album');if(album==='none')where+=' AND m.album IS NULL';else if(album){where+=' AND m.album=?';args.push(album)}
   return json({media:await all(`SELECT m.*,u.name AS owner_name,a.name AS album_name,(SELECT count(*) FROM shares s WHERE s.media=m.id) AS shared_count FROM media m JOIN users u ON u.id=m.owner LEFT JOIN albums a ON a.id=m.album WHERE ${where} AND NOT EXISTS(SELECT 1 FROM settings WHERE key='deleting:'||m.owner) AND m.status='ready' ORDER BY m.created DESC LIMIT 100 OFFSET ?`,...args,offset),stats:await one("SELECT count(*) AS count,COALESCE(sum(size),0) AS bytes FROM media WHERE owner=? AND status='ready' AND deleted IS NULL",u.id)});
  }
  if(p[0]==='uploads'&&!p[1]&&method==='POST'){
@@ -308,6 +309,13 @@ async function route(r:Request):Promise<Response>{
    if(m.owner!==u.id&&u.role!=='owner')fail('Only the uploader or primary admin can manage sharing.',403);
    if(method==='GET')return json({recipients:(await all('SELECT recipient FROM shares WHERE media=?',mid)).map(x=>x.recipient)});
    if(method==='POST'){const b=await body(r);if(!Array.isArray(b.recipients)||b.recipients.length>200)fail('Choose family members.');const recipients=[...new Set(b.recipients)] as string[];for(const x of recipients)if(!await one('SELECT id FROM users WHERE id=? AND active=1',x))fail('Member unavailable.');await db().batch([stmt('DELETE FROM shares WHERE media=?',mid),...recipients.filter(x=>x!==m.owner).map(x=>stmt('INSERT INTO shares(media,recipient) VALUES(?,?)',mid,x))]);return json({ok:true})}
+  }
+  if(p[2]==='rename'&&method==='POST'){
+   if(m.status!=='ready')fail('Verify the upload before renaming it.');
+   const b=await body(r),base=typeof b.baseName==='string'?b.baseName.trim():'';
+   const name=base+mediaNameParts(m.name).extension;
+   if(!base||base==='.'||base==='..'||/[\\/\x00-\x1f\x7f]/.test(base)||name.length>255)fail('Use a name of 1–255 characters including the extension, without slashes or control characters.');
+   await stmt('UPDATE media SET name=? WHERE id=?',name,mid).run();return json({name});
   }
   if(p[2]==='album'&&method==='POST'){const b=await body(r);if(b.album&&!await one('SELECT id FROM albums WHERE id=? AND owner=?',b.album,m.owner))fail('Album not found.');await stmt('UPDATE media SET album=? WHERE id=?',b.album||null,mid).run();return json({ok:true})}
   if(p[2]==='trash'&&method==='POST'){await stmt('UPDATE media SET deleted=? WHERE id=?',now(),mid).run();return json({ok:true})}

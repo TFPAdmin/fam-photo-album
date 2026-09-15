@@ -331,5 +331,38 @@ try{
  await assert.rejects(db.prepare("INSERT INTO sessions(token,user_id,expires) VALUES('late-token',?,?)").bind(doomed.id,Date.now()+100000).run());
  await req('members',{cookie:owner,method:'POST',data:{name:'New Account',username:'doomed-renamed',password:'brandnew-password',mustChange:false}});
  const recreated=await data(await logDoomed('doomed-renamed','brandnew-password'));assert.notEqual(recreated.user.id,doomed.id);
+ // Album assignment during upload, unfiled filtering, and media rename permissions.
+ const mediaCookie=cookie(await logDoomed('doomed-renamed','brandnew-password'));
+ await req('albums',{cookie:mediaCookie,method:'POST',data:{name:'Upload destination'}});
+ const destination=(await data(await req('albums',{cookie:mediaCookie}))).albums[0].id;
+ await req('uploads',{cookie:mediaCookie,method:'POST',data:{name:'foreign.jpg',type:'image/jpeg',size:jpeg.length,album},expect:400});
+ async function smallPhoto(name,chosenAlbum){
+  const mid=(await data(await req('uploads',{cookie:mediaCookie,method:'POST',data:{name,type:'image/jpeg',size:jpeg.length,album:chosenAlbum}}))).id;
+  await req('uploads/'+mid+'/part?part=1',{cookie:mediaCookie,method:'PUT',raw:jpeg,headers:{'x-content-sha256':createHash('sha256').update(jpeg).digest('hex')}});
+  await req('uploads/'+mid+'/complete',{cookie:mediaCookie,method:'POST',data:{}});await req('uploads/'+mid+'/verify',{cookie:mediaCookie,method:'POST',data:{part:1}});return mid;
+ }
+ const filedPhoto=await smallPhoto('filed.jpg',destination),unfiledPhoto=await smallPhoto('loose.jpg',null);
+ assert.deepEqual((await data(await req('media?album='+destination,{cookie:mediaCookie}))).media.map(m=>m.id),[filedPhoto]);
+ assert.deepEqual((await data(await req('media?album=none',{cookie:mediaCookie}))).media.map(m=>m.id),[unfiledPhoto]);
+ assert.equal((await data(await req('media',{cookie:mediaCookie}))).media.length,2);
+ await req('media/'+unfiledPhoto+'/album',{cookie:mediaCookie,method:'POST',data:{album:destination}});
+ assert.equal((await data(await req('media?album=none',{cookie:mediaCookie}))).media.length,0);
+ await req('media/'+unfiledPhoto+'/album',{cookie:mediaCookie,method:'POST',data:{album:null}});
+ const sharedAdmin=(await data(await req('me',{cookie:publicAdmin}))).user.id;
+ await req('media/'+unfiledPhoto+'/shares',{cookie:mediaCookie,method:'POST',data:{recipients:[sharedAdmin]}});
+ await req('media/'+unfiledPhoto+'/rename',{cookie:publicAdmin,method:'POST',data:{baseName:'Not allowed'},expect:404});
+ await req('media/'+unfiledPhoto+'/rename',{method:'POST',data:{baseName:'Not allowed'},expect:401});
+ await req('media/'+unfiledPhoto+'/rename',{cookie:mediaCookie,method:'POST',headers:{origin:'https://evil.test'},data:{baseName:'Not allowed'},expect:403});
+ for(const baseName of ['', '../bad', 'bad\\name', 'x'.repeat(252)])await req('media/'+unfiledPhoto+'/rename',{cookie:mediaCookie,method:'POST',data:{baseName},expect:400});
+ const savedBefore=await db.prepare('SELECT object_key,album,type FROM media WHERE id=?').bind(unfiledPhoto).first();
+ assert.equal((await data(await req('media/'+unfiledPhoto+'/rename',{cookie:mediaCookie,method:'POST',data:{baseName:'Family picnic'}}))).name,'Family picnic.jpg');
+ assert.deepEqual(await db.prepare('SELECT object_key,album,type FROM media WHERE id=?').bind(unfiledPhoto).first(),savedBefore);
+ const renamedDownload=await req('media/'+unfiledPhoto+'/file?download=1',{cookie:publicAdmin});assert.ok(renamedDownload.headers.get('content-disposition').includes('Family%20picnic.jpg'));assert.deepEqual(Buffer.from(await renamedDownload.arrayBuffer()),jpeg);
+ assert.equal((await data(await req('media?album=none',{cookie:mediaCookie}))).media[0].name,'Family picnic.jpg');
+ await req('media/'+unfiledPhoto+'/trash',{cookie:mediaCookie,method:'POST',data:{}});
+ assert.equal((await data(await req('media?album=none',{cookie:mediaCookie}))).media.length,0);
+ assert.deepEqual((await data(await req('media?view=trash&album=none',{cookie:mediaCookie}))).media.map(m=>m.id),[unfiledPhoto]);
+ assert.equal((await data(await req('media/'+upload+'/rename',{cookie:owner,method:'POST',data:{baseName:'Family movie'}}))).name,'Family movie.mp4');
+ const renamedVideo=await req('media/'+upload+'/file',{cookie:owner});assert.deepEqual(Buffer.from(await renamedVideo.arrayBuffer()),bytes);
  console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset, Account Center, all-role recovery, answer privacy, recovery removal, rate limits and rollback, and account disable.`);
 }finally{await mf.dispose()}
