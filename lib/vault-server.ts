@@ -40,6 +40,33 @@ async function route(r:Request):Promise<Response>{
   const b=await body(r),username=String(b.username||'').toLowerCase();await throttle('ip:'+r.headers.get('cf-connecting-ip'),60);await throttle('user:'+username,12);
   const u=await one('SELECT * FROM users WHERE username=? AND active=1',username);const input=typeof b.password==='string'&&b.password.length<=128?b.password:'';const hash=await pw(input,u?.password.split(':')[0]||'00000000000000000000000000000000');if(!u||!eq(hash,u.password))fail('Username or password is incorrect.',401);return session(u);
  }
+ if(p[0]==='owner-reset'&&method==='POST'){
+  await throttle('owner-reset:'+r.headers.get('cf-connecting-ip'),10);
+  const b=await body(r),secret=(env as any).reset_secret;
+  const unavailable=()=>fail('The recovery key is invalid or has already been used.',403);
+  if(typeof secret!=='string'||secret.length<32||secret.length>256||typeof b.key!=='string'||b.key.length>256)unavailable();
+  const fingerprint=await sha(encode(secret));
+  if(!eq(fingerprint,await sha(encode(b.key))))unavailable();
+  const usedKey='owner_reset_used:'+fingerprint;
+  if(await one('SELECT key FROM settings WHERE key=?',usedKey))unavailable();
+  const owner=await one("SELECT * FROM users WHERE role='owner' LIMIT 1");
+  if(!owner)unavailable();
+  const next=password(b.password);
+  if(next!==b.confirm)fail('The new passwords do not match.');
+  if(eq(next,secret))fail('Choose a password different from the recovery key.');
+  const hashed=await pw(next);
+  try{
+   // The unique consumed-key insert and password/session changes commit together.
+   // A concurrent request with the same key rolls back its entire batch.
+   await db().batch([
+    stmt('INSERT INTO settings(key,value) VALUES(?,?)',usedKey,String(now())),
+    stmt('UPDATE users SET password=?,must_change=0,active=1 WHERE id=?',hashed,owner.id),
+    stmt('DELETE FROM sessions WHERE user_id=?',owner.id),
+    stmt('DELETE FROM limits WHERE key=?','user:'+owner.username)
+   ]);
+  }catch(e){if(await one('SELECT key FROM settings WHERE key=?',usedKey))unavailable();throw e}
+  return json({ok:true,username:owner.username});
+ }
  const u=await user(r);
  const expectedUser=r.headers.get('x-vault-user');if(expectedUser&&expectedUser!==u.id)return json({error:'The signed-in account changed in another tab. Please sign in with the account you want to use.',code:'SESSION_CHANGED'},409);
  if(p[0]==='me')return json({user:profile(u)});

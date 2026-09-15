@@ -2,7 +2,9 @@ import {createRequire} from 'node:module';import {readFileSync,readdirSync} from
 const require=createRequire(import.meta.url),w=createRequire(require.resolve('wrangler/package.json'));const {Miniflare}=w('miniflare');const {build}=w('esbuild');
 const bundle=await build({stdin:{contents:"import {handle} from './lib/vault-server.ts';export default {fetch:handle}",resolveDir:process.cwd()},bundle:true,write:false,format:'esm',platform:'neutral',external:['cloudflare:workers']});
 const worker=process.env.TEST_BUILT_WORKER?{modules:[{type:'ESModule',path:'dist/server/index.js'},...readdirSync('dist/server',{recursive:true}).filter(p=>p.endsWith('.js')&&p!=='index.js').map(p=>({type:'ESModule',path:'dist/server/'+p}))]}:{modules:true,script:bundle.outputFiles[0].text};
-const mf=new Miniflare({...worker,compatibilityFlags:['nodejs_compat'],compatibilityDate:'2026-05-15',d1Databases:['DB'],r2Buckets:['BUCKET'],bindings:{SETUP_KEY:'test-setup-key'},cf:false});
+const recoverySecret='test-recovery-key-at-least-32-characters';
+const options={...worker,compatibilityFlags:['nodejs_compat'],compatibilityDate:'2026-05-15',d1Databases:['DB'],r2Buckets:['BUCKET'],bindings:{SETUP_KEY:'test-setup-key',reset_secret:recoverySecret},cf:false};
+const mf=new Miniflare(options);
 let checks=0;const origin='https://vault.test';
 async function req(path,{cookie='',method='GET',data,raw,headers={},expect=200}={}){const r=await mf.dispatchFetch(origin+'/api/vault/'+path,{method,headers:{origin,cookie,'cf-connecting-ip':'192.0.2.1',...(data?{'content-type':'application/json'}:{}),...headers},body:data?JSON.stringify(data):raw});assert.equal(r.status,expect,`${method} ${path}: ${r.status} ${r.status!==expect?await r.text():''}`);checks++;return r}
 const data=async(r)=>r.json(); const cookie=r=>r.headers.get('set-cookie')?.split(';')[0];
@@ -58,5 +60,48 @@ try{
  r=await req('password',{cookie:resetCookie,method:'POST',data:{current:'new-temporary-password',password:'bob-final-password'}});const finalCookie=cookie(r);assert.ok(finalCookie&&finalCookie!==resetCookie);await req('me',{cookie:finalCookie});await req('login',{method:'POST',data:{username:'bob',password:'bob-final-password'}});await req('media',{cookie:finalCookie});
  await req('members/'+b.id+'/reset',{cookie:owner,method:'POST',data:{password:'owner-reset-password'}});await req('me',{cookie:owner});await req('me',{cookie:resetCookie,expect:401});
  await req('members/'+a.id+'/access',{cookie:ad.cookie,method:'POST',data:{active:false}});await req('me',{cookie:a.cookie,expect:401});
- console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset and account disable.`);
+ // Owner recovery: fail closed, transactional one-time use, session revocation and key rotation.
+ const recover=(key,password='recovered-owner-password',extra={})=>req('owner-reset',{method:'POST',data:{key,password,confirm:password},headers:{'cf-connecting-ip':'192.0.2.50'},...extra});
+ const memberBefore=await db.prepare('SELECT password FROM users WHERE id=?').bind(b.id).first();
+ await recover('wrong-recovery-key-value-32-characters','recovered-owner-password',{expect:403});
+ await recover(recoverySecret,'short',{expect:400});
+ await recover(recoverySecret,recoverySecret,{expect:400});
+ await recover(recoverySecret,'recovered-owner-password',{data:{key:recoverySecret,password:'recovered-owner-password',confirm:'different-password'},expect:400});
+ await recover(recoverySecret,'recovered-owner-password',{headers:{origin:'https://evil.test'},expect:403});
+ const usedKey='owner_reset_used:'+createHash('sha256').update(recoverySecret).digest('hex');
+ // An injected storage failure must roll back consumption as well as the password.
+ await db.prepare("CREATE TRIGGER fail_recovery BEFORE UPDATE ON users WHEN OLD.role='owner' BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END").run();
+ await recover(recoverySecret,'recovered-owner-password',{expect:503});
+ assert.equal(await db.prepare('SELECT key FROM settings WHERE key=?').bind(usedKey).first(),null);
+ await req('me',{cookie:owner});
+ await db.prepare('DROP TRIGGER fail_recovery').run();
+ // Two valid simultaneous submissions: exactly one can commit.
+ const attempts=['recovered-owner-password','another-owner-password'];
+ const results=await Promise.all(attempts.map(password=>mf.dispatchFetch(origin+'/api/vault/owner-reset',{method:'POST',headers:{origin,'content-type':'application/json','cf-connecting-ip':'192.0.2.51'},body:JSON.stringify({key:recoverySecret,password,confirm:password})})));
+ assert.deepEqual(results.map(r=>r.status).sort(),[200,403]);checks+=2;
+ const winningPassword=attempts[results.findIndex(r=>r.status===200)];
+ assert.equal((await results.find(r=>r.status===200).json()).username,'owner');
+ await req('me',{cookie:owner,expect:401});
+ await req('login',{method:'POST',data:{username:'owner',password:'owner-password-long'},expect:401});
+ owner=cookie(await req('login',{method:'POST',data:{username:'owner',password:winningPassword}}));
+ assert.equal((await data(await req('me',{cookie:owner}))).user.mustChange,false);
+ await recover(recoverySecret,'should-not-be-applied-password',{expect:403});
+ assert.deepEqual(await db.prepare('SELECT password FROM users WHERE id=?').bind(b.id).first(),memberBefore);
+ await req('me',{cookie:ad.cookie});
+ // Empty/short configuration fails closed. A new key enables another reset.
+ for(const secret of [undefined,'too-short']){
+  await mf.setOptions({...options,bindings:{SETUP_KEY:'test-setup-key',...(secret?{reset_secret:secret}:{})}});
+  await recover(secret||recoverySecret,'should-not-be-applied-password',{expect:403,headers:{'cf-connecting-ip':'192.0.2.52'}});
+ }
+ const nextKey='another-test-recovery-key-at-least-32-characters';
+ await mf.setOptions({...options,bindings:{SETUP_KEY:'test-setup-key',reset_secret:nextKey}});
+ await (await mf.getD1Database('DB')).prepare('UPDATE users SET active=0 WHERE id=?').bind(ownerId).run();
+ await recover(nextKey,'final-owner-password',{headers:{'cf-connecting-ip':'192.0.2.53'}});
+ const recoveredOwner=(await data(await req('login',{method:'POST',data:{username:'owner',password:'final-owner-password'}}))).user;
+ assert.equal(recoveredOwner.id,ownerId);assert.equal(recoveredOwner.active,true);
+ // Redeploying an older secret cannot make it usable again.
+ await mf.setOptions({...options,bindings:{SETUP_KEY:'test-setup-key',reset_secret:recoverySecret}});
+ await recover(recoverySecret,'should-not-be-applied-password',{expect:403,headers:{'cf-connecting-ip':'192.0.2.54'}});
+ for(let i=0;i<11;i++)await recover('incorrect-key','unused-password',{expect:i<10?403:429,headers:{'cf-connecting-ip':'192.0.2.55'}});
+ console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset, owner recovery/replay/concurrency/rollback, and account disable.`);
 }finally{await mf.dispose()}

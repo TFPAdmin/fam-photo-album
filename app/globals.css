@@ -105,3 +105,5 @@ body {
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 .rail[data-slot=sidebar]{width:100%;height:auto}.workspace[data-slot=sidebar-wrapper]{display:grid;min-height:calc(100vh - 88px)}@media(max-width:850px){.workspace[data-slot=sidebar-wrapper]{display:block}.rail[data-slot=sidebar]{display:none}}
 .brand{white-space:normal}.brand>span:last-child{max-width:235px;line-height:1.2}@media(max-width:600px){.brand{font-size:16px}.brand>span:last-child{max-width:165px}.brand-sub{font-size:10px;margin-top:3px}}
+
+.recovery-card{width:100%;max-width:520px;min-width:0;background:#fff;border:1px solid #e0e7f3;border-radius:18px;gap:20px}.recovery-card .brand{white-space:normal}.recovery-card h1{font-size:27px}.recovery-card>p{margin:0;color:#657189}

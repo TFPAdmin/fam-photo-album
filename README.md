@@ -41,8 +41,19 @@ After deployment, open the domain, enter `SETUP_KEY`, and create the owner usern
 - **Owner:** full access to accounts and media; can create admins and members. The owner account is omitted from the directory returned to admins and members. In All family media, choose a family member to filter their collection.
 - **Admin:** creates member accounts, resets member passwords and enables/disables members. Does not automatically gain access to member media or manage owner/admin credentials.
 - **Member:** manages a private collection and albums. Selects individual family members who may view and download a file. Recipients cannot edit or re-share it through the app.
-- Temporary passwords must be changed at first sign-in. Changing your own password rotates the session cookie and revokes all previous sessions. Admin resets revoke the target member’s sessions while preserving the administrator’s session. Admin resets revoke the target member’s sessions while preserving the administrator’s session. Expired or changed accounts return the interface to sign-in rather than leaving stale account controls visible.
+- Temporary passwords must be changed at first sign-in. Changing your own password rotates the session cookie and revokes all previous sessions. Admin resets revoke the target member’s sessions while preserving the administrator’s session. Expired or changed accounts return the interface to sign-in rather than leaving stale account controls visible.
 - No public account registration or ChatGPT authentication. Login, password and setup attempts are rate-limited, and writes require the same request origin.
+
+## Owner password recovery
+
+1. In Cloudflare → Workers & Pages → `fam-photo-album` → Settings → Variables and Secrets, add a **Secret** named exactly `reset_secret` (lowercase). Use a newly generated random value of 32–256 characters, such as a password-manager-generated key or `openssl rand -hex 32`. Save/deploy the change. This must be a runtime secret, not a build variable.
+2. Open **https://familyphotoalbum.xyz/?owner-reset=1**. This page is not linked from normal sign-in. Its URL is not an authentication credential; the secret is required.
+3. Enter the key and a new password of 12–128 characters, then confirm the password. The existing owner account is recovered, all its sessions are revoked, and its username is shown so you can sign in. No media or other accounts are changed.
+4. The key becomes unusable immediately on success. Remove `reset_secret` from Cloudflare when convenient. For another recovery, configure a **different** random value. Re-adding any previously used value will not work.
+
+Automatic single-use invalidation is implemented in D1: only the key's SHA-256 fingerprint is retained in `settings`, and consuming the key, changing the password and revoking sessions occur in one transaction. Failed validation does not consume a key; concurrent requests cannot consume it twice. Missing or short secrets disable recovery. Requests are rate-limited and require the same origin. Recovery can also restore a disabled owner account.
+
+The application does **not** delete the binding from Cloudflare: that requires a separate Cloudflare management API credential. No such credential is required or stored by this feature. Used-key records must be retained; restoring an older D1 backup can restore older recovery state, so remove/rotate the runtime secret after a database restore. Never commit recovery keys to GitHub or include them in URLs.
 
 ## Original-file protection
 
