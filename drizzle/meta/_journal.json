@@ -8,6 +8,13 @@
       "when": 1789414631095,
       "tag": "0000_aromatic_ben_grimm",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1789457205560,
+      "tag": "0001_account_deletion_guards",
+      "breakpoints": true
     }
   ]
 }

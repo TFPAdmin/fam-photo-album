@@ -22,8 +22,8 @@ async function bounded(r:Request,max:number){const reader=r.body?.getReader();if
 async function body(r:Request){if(Number(r.headers.get('content-length')||0)>20000)fail('Request too large',413);const s=new TextDecoder().decode(await bounded(r,20000));if(s.length>20000)fail('Request too large',413);try{return JSON.parse(s)}catch{fail('Invalid request')}}
 function authToken(r:Request){return (r.headers.get('cookie')||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('auth='))?.slice(5)}
 async function user(r:Request){const token=authToken(r);if(!token)fail('Please sign in.',401);const u=await one('SELECT u.*,s.token AS session_token FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>? AND u.active=1',await sha(encode(token)),now());if(!u)fail('Please sign in again.',401);return u}
-async function session(u:any){const token=hex(crypto.getRandomValues(new Uint8Array(32)).buffer);await stmt('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)',await sha(encode(token)),u.id,now()+86400000).run();return json({user:profile(u)},200,{'Set-Cookie':`auth=${token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=86400`})}
-async function access(u:any,mid:string,write=false){const m=await one('SELECT * FROM media WHERE id=?',mid);if(!m)fail('Media not found.',404);if(m.owner!==u.id&&u.role!=='owner'&&(write||m.deleted||m.status!=='ready'||!await one('SELECT media FROM shares WHERE media=? AND recipient=?',mid,u.id)))fail('Media not found.',404);return m}
+async function session(u:any){const token=hex(crypto.getRandomValues(new Uint8Array(32)).buffer);const created=await stmt('INSERT INTO sessions(token,user_id,expires) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM users WHERE id=? AND password=? AND active=1)',await sha(encode(token)),u.id,now()+86400000,u.id,u.password).run();if(!created.meta.changes)fail('Account credentials changed. Please sign in again.',401);return json({user:profile(u)},200,{'Set-Cookie':`auth=${token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=86400`})}
+async function access(u:any,mid:string,write=false){const m=await one("SELECT m.* FROM media m WHERE m.id=? AND NOT EXISTS(SELECT 1 FROM settings WHERE key='deleting:'||m.owner)",mid);if(!m)fail('Media not found.',404);if(m.owner!==u.id&&u.role!=='owner'&&(write||m.deleted||m.status!=='ready'||!await one('SELECT media FROM shares WHERE media=? AND recipient=?',mid,u.id)))fail('Media not found.',404);return m}
 function admin(u:any){if(!['owner','admin'].includes(u.role))fail('Account management access required.',403)}
 function manage(u:any,t:any){admin(u);if(!t)fail('Member not found',404);if(t.role==='owner'||(u.role==='admin'&&t.role!=='member'))fail('Only the primary admin can manage this account.',403)}
 function recoveryAnswers(value:any):{question:string,answer:string}[]{
@@ -35,6 +35,47 @@ function recoveryAnswers(value:any):{question:string,answer:string}[]{
  });
  if(new Set(answers.map(a=>a.question)).size!==3)fail('Choose three different questions.');
  return answers;
+}
+async function deleteAccount(t:any,confirmation:any){
+ const deletionKey='deleting:'+t.id;
+ if(confirmation!==t.username)fail('Type the account username exactly to confirm permanent deletion.');
+ if(!await one('SELECT key FROM settings WHERE key=?',deletionKey)){
+  await db().batch([
+   stmt('UPDATE users SET active=0 WHERE id=?',t.id),
+   stmt("INSERT INTO settings(key,value) VALUES(?,'pending')",deletionKey),
+   stmt('DELETE FROM sessions WHERE user_id=?',t.id),
+   stmt('DELETE FROM shares WHERE recipient=? OR media IN (SELECT id FROM media WHERE owner=?)',t.id,t.id)
+  ]);
+ }
+ const files=await all('SELECT id,object_key,upload_id FROM media WHERE owner=? ORDER BY id LIMIT 20',t.id);
+ if(files.length){
+  for(const m of files){
+   if(!m.object_key.startsWith(t.id+'/'))fail('A stored file has an unexpected location. Deletion is paused.',409);
+   if(m.upload_id){try{await bucket().resumeMultipartUpload(m.object_key,m.upload_id).abort()}catch(e:any){if(!/\(10024\)$/.test(e.message||''))throw e}}
+  }
+  await bucket().delete(files.flatMap(m=>[m.object_key,m.object_key+'.thumb']));
+  const ids=files.map(m=>m.id),placeholders=ids.map(()=>'?').join(',');
+  await db().batch([
+   stmt(`DELETE FROM shares WHERE media IN (${placeholders})`,...ids),
+   stmt(`DELETE FROM parts WHERE media IN (${placeholders})`,...ids),
+   stmt(`DELETE FROM media WHERE id IN (${placeholders}) AND owner=?`,...ids,t.id)
+  ]);
+  return json({done:false,remaining:(await one('SELECT count(*) AS n FROM media WHERE owner=?',t.id)).n});
+ }
+ // Sweep the account's exact UUID prefix, including untracked thumbnails/objects.
+ const objects=await bucket().list({prefix:t.id+'/',limit:100});
+ if(objects.objects.length){await bucket().delete(objects.objects.map(o=>o.key));return json({done:false,remaining:0})}
+ if(objects.truncated)fail('Storage cleanup needs another attempt.',503);
+ await db().batch([
+  stmt('DELETE FROM shares WHERE recipient=?',t.id),
+  stmt('DELETE FROM albums WHERE owner=?',t.id),
+  stmt('DELETE FROM sessions WHERE user_id=?',t.id),
+  stmt('DELETE FROM settings WHERE key=?','recovery:'+t.id),
+  stmt('DELETE FROM limits WHERE key IN (?,?,?,?,?,?)','user:'+t.username,'recovery-user:'+t.username,'password:'+t.id,'username-change:'+t.id,'recovery-settings:'+t.id,'owner-reset:'+t.id),
+  stmt("DELETE FROM users WHERE id=? AND role<>'owner'",t.id),
+  stmt("UPDATE settings SET value='done' WHERE key=?",deletionKey)
+ ]);
+ return json({done:true,remaining:0});
 }
 export async function handle(r:Request){try{return await route(r)}catch(e:any){if(!e.status)console.error('Vault request failed',e);return json({error:e.status?e.message:'The service is unavailable. Your files have not been marked verified. Please try again.'},e.status||503)}}
 async function route(r:Request):Promise<Response>{
@@ -104,7 +145,7 @@ async function route(r:Request):Promise<Response>{
  const expectedUser=r.headers.get('x-vault-user');if(expectedUser&&expectedUser!==u.id)return json({error:'The signed-in account changed in another tab. Please sign in with the account you want to use.',code:'SESSION_CHANGED'},409);
  if(p[0]==='me')return json({user:profile(u)});
  if(p[0]==='logout'&&method==='POST'){const t=authToken(r)||'';await stmt('DELETE FROM sessions WHERE token=?',await sha(encode(t))).run();return json({ok:true},200,{'Set-Cookie':'auth=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0'})}
- if(p[0]==='password'&&method==='POST'){const b=await body(r);await throttle('password:'+u.id,12);if(!eq(await pw(String(b.current||''),u.password.split(':')[0]),u.password))fail('Current password is incorrect.');const nextPassword=await pw(password(b.password));await db().batch([stmt('UPDATE users SET password=?,must_change=0 WHERE id=?',nextPassword,u.id),stmt('DELETE FROM sessions WHERE user_id=?',u.id)]);return session({...u,password:nextPassword,must_change:0})}
+ if(p[0]==='password'&&method==='POST'){const b=await body(r);await throttle('password:'+u.id,12);if(!eq(await pw(String(b.current||''),u.password.split(':')[0]),u.password))fail('Current password is incorrect.');const nextPassword=await pw(password(b.password));const changed=await db().batch([stmt('UPDATE users SET password=?,must_change=0 WHERE id=? AND password=? AND active=1',nextPassword,u.id,u.password),stmt('DELETE FROM sessions WHERE user_id=? AND EXISTS(SELECT 1 FROM users WHERE id=? AND password=?)',u.id,u.id,nextPassword)]);if(!changed[0].meta.changes)fail('Account credentials changed. Please sign in again.',401);return session({...u,password:nextPassword,must_change:0})}
  if(u.must_change)fail('Change your temporary password before continuing.',403);
  if(p[0]==='signup-settings'){
   if(u.role!=='owner')fail('Primary admin access required.',403);
@@ -157,10 +198,47 @@ async function route(r:Request):Promise<Response>{
   fail('Not found.',404);
  }
  if(p[0]==='members'){
-  if(method==='GET')return json({members:await all("SELECT id,username,name,role,active FROM users WHERE (active=1 OR ?=1) AND (role<>'owner' OR ?=1) ORDER BY name COLLATE NOCASE",u.role==='owner'||u.role==='admin'?1:0,u.role==='owner'?1:0)});
-  admin(u);const b=await body(r);
+  if(method==='GET'&&!p[1])return json({members:await all("SELECT id,username,name,role,active,EXISTS(SELECT 1 FROM settings WHERE key='deleting:'||users.id) AS deleting FROM users WHERE (active=1 OR ?=1) AND (role<>'owner' OR ?=1) ORDER BY name COLLATE NOCASE",u.role==='owner'||u.role==='admin'?1:0,u.role==='owner'?1:0)});
+  admin(u);const b=method==='GET'?{}:await body(r);
   if(method==='POST'&&!p[1]){const username=String(b.username||'').toLowerCase();if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');const role=b.role===undefined?'member':b.role;if(!['member','admin'].includes(role))fail('Choose Member or Admin.');const mustChange=forcePasswordChange(b.mustChange);try{await stmt('INSERT INTO users(id,username,name,password,role,must_change,created) VALUES(?,?,?,?,?,?,?)',id(),username,String(b.name||username).trim().slice(0,80),await pw(password(b.password)),role,mustChange,now()).run()}catch{fail('That username is already in use.',409)}return json({ok:true})}
   const t=await one('SELECT * FROM users WHERE id=?',p[1]);
+  if(p[2]==='manage'||p[2]==='delete'){
+   if(u.role!=='owner')fail('Primary admin access required.',403);
+   if(p[1]===u.id||t?.role==='owner')fail('Use Account Center for the primary admin. This account cannot be deleted or reassigned.',403);
+   if(!t){if(p[2]==='delete'&&method==='POST'&&(await one('SELECT value FROM settings WHERE key=?','deleting:'+p[1]))?.value==='done')return json({done:true,remaining:0});fail('Account not found.',404)}
+   const deleting=!!await one('SELECT key FROM settings WHERE key=?','deleting:'+t.id);
+   if(p[2]==='delete'&&method==='POST'){
+    try{return await deleteAccount(t,b.confirmUsername)}catch(e:any){if(e.status)throw e;fail('Deletion paused. Retry to finish removing this account and its files.',503)}
+   }
+   if(p[2]==='manage'&&method==='GET'){
+    const recovery=await one('SELECT value FROM settings WHERE key=?','recovery:'+t.id);
+    return json({user:profile(t),deleting,recoveryQuestions:recovery?JSON.parse(recovery.value).answers.map((a:any)=>a.question):[],media:await one('SELECT count(*) AS count,COALESCE(sum(size),0) AS bytes FROM media WHERE owner=?',t.id)});
+   }
+   if(p[2]==='manage'&&method==='POST'){
+    if(deleting)fail('Deletion has started. Resume deletion to finish removing this account.',409);
+    const name=typeof b.name==='string'?b.name.trim():'',username=typeof b.username==='string'?b.username.trim().toLowerCase():'';
+    if(!name||name.length>80)fail('Use a name with 1–80 characters.');
+    if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');
+    if(!['member','admin'].includes(b.role)||typeof b.active!=='boolean'||typeof b.mustChange!=='boolean')fail('Choose a valid access level and sign-in settings.');
+    const reset=b.password!==undefined&&b.password!=='';
+    const nextPassword=reset?await pw(password(b.password)):t.password;
+    if(reset&&b.password!==b.confirm)fail('The new passwords do not match.');
+    const recoveryAction=b.recoveryAction||'keep';if(!['keep','clear','replace'].includes(recoveryAction))fail('Choose how to update recovery questions.');
+    const updates=[];
+    if(recoveryAction==='replace'){
+     const hashed=[];for(const a of recoveryAnswers(b.answers))hashed.push({question:a.question,hash:await pw(a.answer)});
+     updates.push(stmt('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','recovery:'+t.id,JSON.stringify({version:id(),answers:hashed})));
+    }else if(reset||recoveryAction==='clear')updates.push(stmt('DELETE FROM settings WHERE key=?','recovery:'+t.id));
+    try{await db().batch([
+     stmt("UPDATE users SET name=?,username=?,password=?,role=?,active=?,must_change=? WHERE id=? AND role<>'owner'",name,username,nextPassword,b.role,b.active?1:0,b.mustChange?1:0,t.id),
+     ...updates,stmt('DELETE FROM sessions WHERE user_id=?',t.id),
+     stmt('DELETE FROM limits WHERE key IN (?,?,?,?)','user:'+t.username,'user:'+username,'recovery-user:'+t.username,'recovery-user:'+username)
+    ])}catch(e){if(await one('SELECT id FROM users WHERE username=? AND id<>?',username,t.id))fail('That username is already in use.',409);throw e}
+    return json({ok:true});
+   }
+   fail('Not found.',404);
+  }
+  if(t&&await one('SELECT key FROM settings WHERE key=?','deleting:'+t.id))fail('This account is being deleted.',409);
   if(p[2]==='role'&&method==='POST'){
    if(!t)fail('Account not found.',404);
    if(t.role==='owner')fail('The primary admin access level cannot be changed.',403);
@@ -188,7 +266,7 @@ async function route(r:Request):Promise<Response>{
   const member=url.searchParams.get('member');if(member){if(u.role!=='owner'||view!=='family')fail('This filter is available in the primary admin’s family collection.',403);where+=' AND m.owner=?';args.push(member)}
   if(view==='trash')where='m.owner=? AND m.deleted IS NOT NULL';
   const album=url.searchParams.get('album');if(album){where+=' AND m.album=?';args.push(album)}
-  return json({media:await all(`SELECT m.*,u.name AS owner_name,a.name AS album_name,(SELECT count(*) FROM shares s WHERE s.media=m.id) AS shared_count FROM media m JOIN users u ON u.id=m.owner LEFT JOIN albums a ON a.id=m.album WHERE ${where} AND m.status='ready' ORDER BY m.created DESC LIMIT 100 OFFSET ?`,...args,offset),stats:await one("SELECT count(*) AS count,COALESCE(sum(size),0) AS bytes FROM media WHERE owner=? AND status='ready' AND deleted IS NULL",u.id)});
+  return json({media:await all(`SELECT m.*,u.name AS owner_name,a.name AS album_name,(SELECT count(*) FROM shares s WHERE s.media=m.id) AS shared_count FROM media m JOIN users u ON u.id=m.owner LEFT JOIN albums a ON a.id=m.album WHERE ${where} AND NOT EXISTS(SELECT 1 FROM settings WHERE key='deleting:'||m.owner) AND m.status='ready' ORDER BY m.created DESC LIMIT 100 OFFSET ?`,...args,offset),stats:await one("SELECT count(*) AS count,COALESCE(sum(size),0) AS bytes FROM media WHERE owner=? AND status='ready' AND deleted IS NULL",u.id)});
  }
  if(p[0]==='uploads'&&!p[1]&&method==='POST'){
   const b=await body(r);if(!Number.isSafeInteger(b.size)||b.size<=0||b.size>20*1024**3)fail('Choose a file up to 20 GB.');
@@ -223,7 +301,7 @@ async function route(r:Request):Promise<Response>{
    const obj=await bucket().get(m.object_key,opts);if(!obj||!('body' in obj))fail('Stored file unavailable.',404);const headers:Record<string,string>={'Content-Type':m.type,'Content-Disposition':`${url.searchParams.has('download')?'attachment':'inline'}; filename*=UTF-8''${encodeURIComponent(m.name)}`,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff','Accept-Ranges':'bytes','Content-Security-Policy':"default-src 'none'; sandbox"};if(opts.range){headers['Content-Range']=`bytes ${opts.range.offset}-${opts.range.offset+opts.range.length-1}/${m.size}`;headers['Content-Length']=String(opts.range.length)}else headers['Content-Length']=String(m.size);return new Response(obj.body,{status:range?206:200,headers});
   }
   if(p[2]==='thumbnail'){
-   if(method==='PUT'){if(m.status!=='ready')fail('Verify the original first.');if(Number(r.headers.get('content-length')||0)>500000)fail('Thumbnail too large.');const b=await bounded(r,500000);const a=new Uint8Array(b);if(b.byteLength>500000||a[0]!==255||a[1]!==216||a[2]!==255)fail('Invalid thumbnail.');await bucket().put(m.object_key+'.thumb',b,{httpMetadata:{contentType:'image/jpeg'}});await stmt('UPDATE media SET thumbnail=1 WHERE id=?',mid).run();return json({ok:true})}
+   if(method==='PUT'){if(m.status!=='ready')fail('Verify the original first.');if(Number(r.headers.get('content-length')||0)>500000)fail('Thumbnail too large.');const b=await bounded(r,500000);const a=new Uint8Array(b);if(b.byteLength>500000||a[0]!==255||a[1]!==216||a[2]!==255)fail('Invalid thumbnail.');await bucket().put(m.object_key+'.thumb',b,{httpMetadata:{contentType:'image/jpeg'}});try{const updated=await stmt('UPDATE media SET thumbnail=1 WHERE id=?',mid).run();if(!updated.meta.changes)fail('Media is unavailable.',404)}catch(e){await bucket().delete(m.object_key+'.thumb');throw e}return json({ok:true})}
    if(method==='GET'){if(m.deleted||m.status!=='ready')fail('Unavailable.',404);const obj=await bucket().get(m.object_key+'.thumb');if(!obj)fail('Thumbnail unavailable.',404);return new Response(obj.body,{headers:{'Content-Type':'image/jpeg','Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'}})}
   }
   if(p[2]==='shares'){

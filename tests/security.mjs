@@ -9,7 +9,7 @@ let checks=0;const origin='https://vault.test';
 async function req(path,{cookie='',method='GET',data,raw,headers={},expect=200}={}){const r=await mf.dispatchFetch(origin+'/api/vault/'+path,{method,headers:{origin,cookie,'cf-connecting-ip':'192.0.2.1',...(data?{'content-type':'application/json'}:{}),...headers},body:data?JSON.stringify(data):raw});assert.equal(r.status,expect,`${method} ${path}: ${r.status} ${r.status!==expect?await r.text():''}`);checks++;return r}
 const data=async(r)=>r.json(); const cookie=r=>r.headers.get('set-cookie')?.split(';')[0];
 try{
- const db=await mf.getD1Database('DB');for(const sql of readFileSync('drizzle/0000_aromatic_ben_grimm.sql','utf8').split('--> statement-breakpoint'))if(sql.trim())await db.prepare(sql.trim()).run();
+ const db=await mf.getD1Database('DB');for(const file of readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())for(const sql of readFileSync('drizzle/'+file,'utf8').split('--> statement-breakpoint'))if(sql.trim())await db.prepare(sql.trim()).run();
  assert.equal((await data(await req('status'))).needsSetup,true);
  await req('setup',{method:'POST',data:{key:'wrong'},expect:403});
  let r=await req('setup',{method:'POST',data:{key:'test-setup-key',name:'Owner',username:'owner',password:'owner-password-long'}}),owner=cookie(r);const ownerId=(await data(r)).user.id;
@@ -239,5 +239,95 @@ try{
  await req('signup-settings',{cookie:owner,method:'POST',data:{enabled:true}});
  for(let i=0;i<6;i++)await signup({...applicant,username:'invalid username'},i<5?400:429,{'cf-connecting-ip':'192.0.2.199'});
  await req('signup-settings',{cookie:owner,method:'POST',data:{enabled:false}});
+ // Full Primary admin editor: permissions, atomic validation and opaque recovery hashes.
+ await req('members',{cookie:owner,method:'POST',data:{username:'doomed',name:'Before Edit',role:'admin',password:'initial-password',mustChange:false}});
+ const logDoomed=(username,password)=>req('login',{method:'POST',headers:{'cf-connecting-ip':'192.0.2.207'},data:{username,password}});
+ const doomedLogin=await logDoomed('doomed','initial-password'),doomedCookie=cookie(doomedLogin),doomed=(await data(doomedLogin)).user;
+ const managePath='members/'+doomed.id+'/manage',deletePath='members/'+doomed.id+'/delete';
+ const editPayload={name:'After Edit',username:'doomed-renamed',role:'member',active:true,mustChange:false,recoveryAction:'keep'};
+ for(const actor of [publicAdmin,directCookie]){
+  await req(managePath,{cookie:actor,expect:403});
+  await req(managePath,{cookie:actor,method:'POST',data:editPayload,expect:403});
+  await req(deletePath,{cookie:actor,method:'POST',data:{confirmUsername:'doomed'},expect:403});
+ }
+ await req(managePath,{expect:401});
+ await req('members/'+ownerId+'/manage',{cookie:owner,expect:403});
+ await req('members/'+ownerId+'/delete',{cookie:owner,method:'POST',data:{confirmUsername:'owner-renamed'},expect:403});
+ await req(managePath,{cookie:owner,method:'POST',headers:{origin:'https://evil.test'},data:editPayload,expect:403});
+ await req('account/recovery',{cookie:doomedCookie,method:'POST',data:{current:'initial-password',answers}});
+ const originalRecovery=await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+doomed.id).first();
+ const privateView=await data(await req(managePath,{cookie:owner}));assert.equal(privateView.user.id,doomed.id);assert.deepEqual(privateView.recoveryQuestions,answers.map(a=>a.question));assert.ok(!JSON.stringify(privateView).includes('hash'));assert.ok(!JSON.stringify(privateView).includes('password'));assert.ok(!JSON.stringify(privateView).includes('Bluebird'));
+ await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,username:'OWNER-RENAMED',recoveryAction:'clear'},expect:409});
+ assert.equal((await data(await req('me',{cookie:doomedCookie}))).user.name,'Before Edit');
+ assert.deepEqual(await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+doomed.id).first(),originalRecovery);
+ await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,role:'owner'},expect:400});
+ await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,recoveryAction:'replace',answers:[answers[0],answers[0],answers[2]]},expect:400});
+ await req(managePath,{cookie:owner,method:'POST',data:editPayload});
+ await req('me',{cookie:doomedCookie,expect:401});
+ let managedCookie=cookie(await logDoomed('doomed-renamed','initial-password'));
+ assert.deepEqual(await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+doomed.id).first(),originalRecovery);
+ await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,password:'new-pass',confirm:'mismatch'},expect:400});
+ await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,password:'new-pass',confirm:'new-pass',mustChange:true}});
+ assert.equal(await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+doomed.id).first(),null);
+ const forcedManaged=await logDoomed('doomed-renamed','new-pass');assert.equal((await data(forcedManaged)).user.mustChange,true);
+ const replacement=answers.map(a=>({...a,answer:'Private '+a.answer}));
+ await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,recoveryAction:'replace',answers:replacement}});
+ await req('forgot-password',{method:'POST',headers:{'cf-connecting-ip':'192.0.2.208'},data:{username:'doomed-renamed',answers:replacement,password:'final-pass',confirm:'final-pass'}});
+ await req(managePath,{cookie:owner,method:'POST',data:{...editPayload,active:false}});
+ await req('login',{method:'POST',headers:{'cf-connecting-ip':'192.0.2.207'},data:{username:'doomed-renamed',password:'final-pass'},expect:401});
+ await req(managePath,{cookie:owner,method:'POST',data:editPayload});managedCookie=cookie(await logDoomed('doomed-renamed','final-pass'));
+ // Actual verified upload, thumbnail, unfinished multipart upload, and >1 deletion batch.
+ await req('albums',{cookie:managedCookie,method:'POST',data:{name:'Deletion test'}});
+ const doomedAlbum=(await data(await req('albums',{cookie:managedCookie}))).albums[0].id;
+ const jpeg=Buffer.from([255,216,255,217]);
+ const photo=(await data(await req('uploads',{cookie:managedCookie,method:'POST',data:{name:'owned.jpg',type:'image/jpeg',size:jpeg.length,album:doomedAlbum}}))).id;
+ await req('uploads/'+photo+'/part?part=1',{cookie:managedCookie,method:'PUT',raw:jpeg,headers:{'x-content-sha256':createHash('sha256').update(jpeg).digest('hex')}});
+ await req('uploads/'+photo+'/complete',{cookie:managedCookie,method:'POST',data:{}});await req('uploads/'+photo+'/verify',{cookie:managedCookie,method:'POST',data:{part:1}});
+ await req('media/'+photo+'/thumbnail',{cookie:managedCookie,method:'PUT',raw:jpeg});
+ await req('media/'+photo+'/shares',{cookie:managedCookie,method:'POST',data:{recipients:[b.id]}});
+ await req('media/'+upload+'/shares',{cookie:owner,method:'POST',data:{recipients:[doomed.id]}});
+ const pending=(await data(await req('uploads',{cookie:managedCookie,method:'POST',data:{name:'pending.jpg',type:'image/jpeg',size:jpeg.length}}))).id;
+ await req('uploads/'+pending+'/part?part=1',{cookie:managedCookie,method:'PUT',raw:jpeg,headers:{'x-content-sha256':createHash('sha256').update(jpeg).digest('hex')}});
+ const pendingRecord=await db.prepare('SELECT object_key,upload_id FROM media WHERE id=?').bind(pending).first();
+ for(let i=0;i<24;i++){
+  const mid='delete-fixture-'+i,key=doomed.id+'/'+mid;
+  await r2.put(key,jpeg);
+  await db.prepare("INSERT INTO media(id,owner,name,type,size,object_key,status,created,deleted) VALUES(?,?,?,'image/jpeg',4,?,'ready',?,?)").bind(mid,doomed.id,'fixture.jpg',key,Date.now(),i%2?Date.now():null).run();
+ }
+ await r2.put(doomed.id+'/untracked-thumb',jpeg);
+ const siblingPrefix=doomed.id+'-other/sentinel';await r2.put(siblingPrefix,jpeg);
+ await req(deletePath,{cookie:owner,method:'POST',data:{confirmUsername:'wrong'},expect:400});
+ await req(deletePath,{cookie:owner,method:'POST',headers:{origin:'https://evil.test'},data:{confirmUsername:'doomed-renamed'},expect:403});
+ assert.equal((await data(await req('me',{cookie:managedCookie}))).user.active,true);
+ const deleteNext=()=>req(deletePath,{cookie:owner,method:'POST',data:{confirmUsername:'doomed-renamed'}});
+ // Fail after storage deletion; database rows must remain available for a retry.
+ await db.prepare("CREATE TRIGGER fail_delete_test BEFORE DELETE ON media WHEN OLD.owner IN(SELECT id FROM users WHERE username='doomed-renamed') BEGIN SELECT RAISE(ABORT,'simulated deletion failure'); END").run();
+ await req(deletePath,{cookie:owner,method:'POST',data:{confirmUsername:'doomed-renamed'},expect:503});
+ assert.equal((await db.prepare('SELECT count(*) AS n FROM media WHERE owner=?').bind(doomed.id).first()).n,26);
+ await req('me',{cookie:managedCookie,expect:401});
+ const during=await data(await req(managePath,{cookie:owner}));assert.equal(during.deleting,true);assert.equal(during.user.active,false);
+ await req('members/'+doomed.id+'/access',{cookie:owner,method:'POST',data:{active:true},expect:409});
+ await req(managePath,{cookie:owner,method:'POST',data:editPayload,expect:409});
+ await req('media/'+photo+'/file',{cookie:owner,expect:404});
+ await assert.rejects(db.prepare("INSERT INTO albums(id,owner,name) VALUES('late-album',?,'Late')").bind(doomed.id).run());
+ await assert.rejects(db.prepare("INSERT INTO media(id,owner,name,type,size,object_key,status,created) VALUES('late-media',?,'Late','image/jpeg',4,?,'ready',1)").bind(doomed.id,doomed.id+'/late').run());
+ await assert.rejects(db.prepare("UPDATE users SET active=1 WHERE id=?").bind(doomed.id).run());
+ await db.prepare('DROP TRIGGER fail_delete_test').run();
+ let deletion=await data(await deleteNext());assert.equal(deletion.done,false);assert.equal(deletion.remaining,6);
+ for(let i=0;i<8&&!deletion.done;i++)deletion=await data(await deleteNext());assert.equal(deletion.done,true);
+ assert.equal((await data(await deleteNext())).done,true);
+ assert.equal(await db.prepare('SELECT id FROM users WHERE id=?').bind(doomed.id).first(),null);
+ for(const [table,column] of [['media','owner'],['albums','owner'],['sessions','user_id'],['shares','recipient']])assert.equal((await db.prepare('SELECT count(*) AS n FROM '+table+' WHERE '+column+'=?').bind(doomed.id).first()).n,0);
+ assert.equal(await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+doomed.id).first(),null);
+ assert.equal((await db.prepare('SELECT count(*) AS n FROM parts WHERE media IN (?,?)').bind(photo,pending).first()).n,0);
+ assert.equal((await db.prepare('SELECT count(*) AS n FROM shares WHERE media=?').bind(photo).first()).n,0);
+ assert.equal((await r2.list({prefix:doomed.id+'/'})).objects.length,0);
+ await assert.rejects(r2.resumeMultipartUpload(pendingRecord.object_key,pendingRecord.upload_id).uploadPart(1,jpeg));
+ assert.ok(await r2.head(siblingPrefix));assert.ok(await r2.head(object.object_key));
+ await req('media/'+upload+'/file',{cookie:owner});await req('me',{cookie:publicAdmin});
+ // Deleted credentials cannot be used to recreate storage records, but the username can be registered again with a new ID.
+ await assert.rejects(db.prepare("INSERT INTO sessions(token,user_id,expires) VALUES('late-token',?,?)").bind(doomed.id,Date.now()+100000).run());
+ await req('members',{cookie:owner,method:'POST',data:{name:'New Account',username:'doomed-renamed',password:'brandnew-password',mustChange:false}});
+ const recreated=await data(await logDoomed('doomed-renamed','brandnew-password'));assert.notEqual(recreated.user.id,doomed.id);
  console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset, Account Center, all-role recovery, answer privacy, recovery removal, rate limits and rollback, and account disable.`);
 }finally{await mf.dispose()}

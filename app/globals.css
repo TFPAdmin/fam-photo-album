@@ -113,3 +113,5 @@ body {
 .reset-choice{display:flex;flex-direction:row;align-items:flex-start;gap:12px;min-height:44px;line-height:1.5;padding:12px;background:#f2f5fc;border-radius:9px;cursor:pointer}.reset-choice input{flex-shrink:0;width:20px;height:20px;margin-top:1px;accent-color:#214dce}
 
 .signup-settings{margin-bottom:24px}.signup-settings a{color:#214dce;text-decoration:underline}.signup-settings>p:last-child{margin-top:14px;margin-bottom:0}
+
+.member-editor{display:grid;gap:24px;min-width:0}.member-editor h3{font-size:18px;font-weight:650;margin-top:5px}.member-select{width:100%;min-width:0;height:46px;padding:8px;border:1px solid #ccd6e6;border-radius:8px;background:white;font-size:16px}.account-delete{display:grid;gap:16px;border-top:1px solid #edc6c6;padding-top:24px}.account-delete p{font-size:14px;line-height:1.65;color:#6f5454}.delete-account-button{background:#9d3030!important;color:white!important;white-space:normal!important;height:auto!important;min-height:44px}.member-editor .form-fields{gap:17px}.member-editor fieldset{min-width:0}

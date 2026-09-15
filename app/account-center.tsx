@@ -5,8 +5,8 @@ import {Input} from '@/components/ui/input';
 import {RECOVERY_QUESTIONS} from '@/lib/recovery-questions';
 
 type Api=(path:string,data?:any,method?:string)=>Promise<any>;
-function questionData(form:FormData){return [0,1,2].map(i=>({question:form.get('question'+i),answer:form.get('answer'+i)}))}
-function Questions({initial=[]}:{initial?:string[]}){
+export function questionData(form:FormData){return [0,1,2].map(i=>({question:form.get('question'+i),answer:form.get('answer'+i)}))}
+export function Questions({initial=[]}:{initial?:string[]}){
  const [selected,setSelected]=useState<string[]>([0,1,2].map(i=>initial[i]||''));
  return <fieldset className="question-fields"><legend>Three secret questions</legend>{selected.map((value,i)=><div className="question-pair" key={i}>
   <label>Question {i+1}<select name={'question'+i} required value={value} onChange={e=>setSelected(old=>old.map((q,n)=>n===i?e.target.value:q))}><option value="" disabled>Choose a question</option>{RECOVERY_QUESTIONS.map(q=><option key={q.id} value={q.id} disabled={selected.includes(q.id)&&value!==q.id}>{q.label}</option>)}</select></label>
