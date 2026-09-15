@@ -163,5 +163,37 @@ try{
  const direct=await req('login',{method:'POST',data:{username:'direct',password:'direct-login-password'}}),directCookie=cookie(direct);
  assert.equal((await data(direct)).user.mustChange,false);await req('account',{cookie:directCookie});
  await req('members/'+b.id+'/reset',{cookie:directCookie,method:'POST',data:{password:'not-allowed-password',mustChange:false},expect:403});
+ // Admin-managed roles never grant the primary admin's media access.
+ ad.cookie=cookie(await req('login',{method:'POST',data:{username:'admin',password:'owner-updated-admin'}}));
+ const changeRole=(target,role,actor=ad.cookie,expect=200)=>req('members/'+target+'/role',{cookie:actor,method:'POST',data:{role},expect});
+ await changeRole(b.id,'admin',directCookie,403);
+ await changeRole(ownerId,'member',ad.cookie,403);
+ await changeRole(ad.id,'member',ad.cookie,403);
+ await changeRole(b.id,'owner',ad.cookie,400);
+ await req('members',{cookie:ad.cookie,method:'POST',data:{username:'forbidden-owner',password:'not-allowed-password',role:'owner'},expect:400});
+ await req('members/'+b.id+'/reset',{cookie:owner,method:'POST',data:{password:'role-test-password-long',mustChange:false}});
+ const beforeRole=cookie(await req('login',{method:'POST',data:{username:'bob',password:'role-test-password-long'}}));
+ await changeRole(b.id,'admin');await req('me',{cookie:beforeRole,expect:401});
+ const promoted=await req('login',{method:'POST',data:{username:'bob',password:'role-test-password-long'}}),promotedCookie=cookie(promoted);
+ assert.equal((await data(promoted)).user.role,'admin');
+ await req('media?view=family',{cookie:promotedCookie,expect:403});
+ assert.equal((await data(await req('media',{cookie:promotedCookie}))).media.length,0);
+ await req('media/'+upload+'/file',{cookie:promotedCookie,expect:404});
+ await req('media/'+upload+'/thumbnail',{cookie:promotedCookie,expect:404});
+ await req('media/'+upload+'/shares',{cookie:promotedCookie,expect:404});
+ assert.ok(!(await data(await req('members',{cookie:promotedCookie}))).members.some(m=>m.role==='owner'));
+ await req('media/'+upload+'/shares',{cookie:owner,method:'POST',data:{recipients:[b.id]}});
+ await req('media/'+upload+'/file',{cookie:promotedCookie});
+ await req('media/'+upload+'/trash',{cookie:promotedCookie,method:'POST',data:{},expect:404});
+ await req('media/'+upload+'/shares',{cookie:owner,method:'POST',data:{recipients:[]}});
+ await req('media/'+upload+'/file',{cookie:promotedCookie,expect:404});
+ await changeRole(b.id,'member');await req('me',{cookie:promotedCookie,expect:401});
+ const demoted=await req('login',{method:'POST',data:{username:'bob',password:'role-test-password-long'}}),demotedCookie=cookie(demoted);
+ assert.equal((await data(demoted)).user.role,'member');await changeRole(a.id,'admin',demotedCookie,403);
+ await req('members',{cookie:ad.cookie,method:'POST',data:{name:'New Admin',username:'new-admin',password:'new-admin-password',role:'admin',mustChange:false}});
+ const newAdmin=await data(await req('login',{method:'POST',data:{username:'new-admin',password:'new-admin-password'}}));assert.equal(newAdmin.user.role,'admin');
+ await changeRole(ad.id,'member',owner);await req('me',{cookie:ad.cookie,expect:401});
+ assert.equal((await data(await req('me',{cookie:owner}))).user.role,'owner');
+ await req('media/'+upload+'/file',{cookie:owner});
  console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset, Account Center, all-role recovery, answer privacy, recovery removal, rate limits and rollback, and account disable.`);
 }finally{await mf.dispose()}

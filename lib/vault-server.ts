@@ -25,7 +25,7 @@ async function user(r:Request){const token=authToken(r);if(!token)fail('Please s
 async function session(u:any){const token=hex(crypto.getRandomValues(new Uint8Array(32)).buffer);await stmt('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)',await sha(encode(token)),u.id,now()+86400000).run();return json({user:profile(u)},200,{'Set-Cookie':`auth=${token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=86400`})}
 async function access(u:any,mid:string,write=false){const m=await one('SELECT * FROM media WHERE id=?',mid);if(!m)fail('Media not found.',404);if(m.owner!==u.id&&u.role!=='owner'&&(write||m.deleted||m.status!=='ready'||!await one('SELECT media FROM shares WHERE media=? AND recipient=?',mid,u.id)))fail('Media not found.',404);return m}
 function admin(u:any){if(!['owner','admin'].includes(u.role))fail('Account management access required.',403)}
-function manage(u:any,t:any){admin(u);if(!t)fail('Member not found',404);if(t.role==='owner'||(u.role==='admin'&&t.role!=='member'))fail('Only the owner can manage this account.',403)}
+function manage(u:any,t:any){admin(u);if(!t)fail('Member not found',404);if(t.role==='owner'||(u.role==='admin'&&t.role!=='member'))fail('Only the primary admin can manage this account.',403)}
 function recoveryAnswers(value:any):{question:string,answer:string}[]{
  if(!Array.isArray(value)||value.length!==3)fail('Choose three different recovery questions and answer each one.');
  const answers=value.map(a=>{
@@ -45,8 +45,8 @@ async function route(r:Request):Promise<Response>{
   await throttle('setup:'+r.headers.get('cf-connecting-ip'),10);const b=await body(r);const key=(env as any).SETUP_KEY;
   if(!key||typeof b.key!=='string'||!eq(key,b.key))fail('The setup key is incorrect.',403);
   const username=String(b.username||'').toLowerCase();if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');
-  const u={id:id(),username,name:String(b.name||'Owner').trim().slice(0,80),password:await pw(password(b.password)),role:'owner',must_change:0,active:1};
-  try{await db().batch([stmt("INSERT INTO settings(key,value) VALUES('owner_initialized','yes')"),stmt('INSERT INTO users(id,username,name,password,role,must_change,active,created) VALUES(?,?,?,?,?,0,1,?)',u.id,u.username,u.name,u.password,u.role,now())])}catch{fail('The owner account has already been created.',409)}return session(u);
+  const u={id:id(),username,name:String(b.name||'Primary admin').trim().slice(0,80),password:await pw(password(b.password)),role:'owner',must_change:0,active:1};
+  try{await db().batch([stmt("INSERT INTO settings(key,value) VALUES('owner_initialized','yes')"),stmt('INSERT INTO users(id,username,name,password,role,must_change,active,created) VALUES(?,?,?,?,?,0,1,?)',u.id,u.username,u.name,u.password,u.role,now())])}catch{fail('The primary admin account has already been created.',409)}return session(u);
  }
  if(p[0]==='login'&&method==='POST'){
   const b=await body(r),username=String(b.username||'').toLowerCase();await throttle('ip:'+r.headers.get('cf-connecting-ip'),60);await throttle('user:'+username,12);
@@ -132,8 +132,21 @@ async function route(r:Request):Promise<Response>{
  if(p[0]==='members'){
   if(method==='GET')return json({members:await all("SELECT id,username,name,role,active FROM users WHERE (active=1 OR ?=1) AND (role<>'owner' OR ?=1) ORDER BY name COLLATE NOCASE",u.role==='owner'||u.role==='admin'?1:0,u.role==='owner'?1:0)});
   admin(u);const b=await body(r);
-  if(method==='POST'&&!p[1]){const username=String(b.username||'').toLowerCase();if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');const role=u.role==='owner'&&b.role==='admin'?'admin':'member',mustChange=forcePasswordChange(b.mustChange);try{await stmt('INSERT INTO users(id,username,name,password,role,must_change,created) VALUES(?,?,?,?,?,?,?)',id(),username,String(b.name||username).trim().slice(0,80),await pw(password(b.password)),role,mustChange,now()).run()}catch{fail('That username is already in use.',409)}return json({ok:true})}
-  const t=await one('SELECT * FROM users WHERE id=?',p[1]);manage(u,t);
+  if(method==='POST'&&!p[1]){const username=String(b.username||'').toLowerCase();if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');const role=b.role===undefined?'member':b.role;if(!['member','admin'].includes(role))fail('Choose Member or Admin.');const mustChange=forcePasswordChange(b.mustChange);try{await stmt('INSERT INTO users(id,username,name,password,role,must_change,created) VALUES(?,?,?,?,?,?,?)',id(),username,String(b.name||username).trim().slice(0,80),await pw(password(b.password)),role,mustChange,now()).run()}catch{fail('That username is already in use.',409)}return json({ok:true})}
+  const t=await one('SELECT * FROM users WHERE id=?',p[1]);
+  if(p[2]==='role'&&method==='POST'){
+   if(!t)fail('Account not found.',404);
+   if(t.role==='owner')fail('The primary admin access level cannot be changed.',403);
+   if(t.id===u.id)fail('Ask another admin to change your access level.',403);
+   if(!['member','admin'].includes(b.role))fail('Choose Member or Admin.');
+   const result=await db().batch([
+    stmt("UPDATE users SET role=? WHERE id=? AND role IN ('member','admin') AND EXISTS(SELECT 1 FROM users actor WHERE actor.id=? AND actor.active=1 AND actor.role IN ('owner','admin'))",b.role,t.id,u.id),
+    stmt("DELETE FROM sessions WHERE user_id=? AND EXISTS(SELECT 1 FROM users actor WHERE actor.id=? AND actor.active=1 AND actor.role IN ('owner','admin'))",t.id,u.id)
+   ]);
+   if(!result[0].meta.changes)fail('The account changed. Refresh and try again.',409);
+   return json({ok:true});
+  }
+  manage(u,t);
   if(p[2]==='reset'&&method==='POST'){const mustChange=forcePasswordChange(b.mustChange);await db().batch([stmt('UPDATE users SET password=?,must_change=? WHERE id=?',await pw(password(b.password)),mustChange,t.id),stmt('DELETE FROM sessions WHERE user_id=?',t.id),stmt('DELETE FROM settings WHERE key=?','recovery:'+t.id)]);return json({ok:true})}
   if(p[2]==='access'&&method==='POST'){await db().batch([stmt('UPDATE users SET active=? WHERE id=?',b.active?1:0,t.id),stmt('DELETE FROM sessions WHERE user_id=?',t.id)]);return json({ok:true})}
  }
@@ -144,8 +157,8 @@ async function route(r:Request):Promise<Response>{
  if(p[0]==='media'&&!p[1]&&method==='GET'){
   const view=url.searchParams.get('view')||'mine',offset=Math.max(0,Number(url.searchParams.get('offset'))||0);let where='m.owner=? AND m.deleted IS NULL',args:any[]=[u.id];
   if(view==='shared'){where='m.deleted IS NULL AND EXISTS(SELECT 1 FROM shares s WHERE s.media=m.id AND s.recipient=?)';}
-  if(view==='family'){if(u.role!=='owner')fail('Owner access required.',403);where='m.deleted IS NULL';args=[]}
-  const member=url.searchParams.get('member');if(member){if(u.role!=='owner'||view!=='family')fail('This filter is available in the owner’s family collection.',403);where+=' AND m.owner=?';args.push(member)}
+  if(view==='family'){if(u.role!=='owner')fail('Primary admin access required.',403);where='m.deleted IS NULL';args=[]}
+  const member=url.searchParams.get('member');if(member){if(u.role!=='owner'||view!=='family')fail('This filter is available in the primary admin’s family collection.',403);where+=' AND m.owner=?';args.push(member)}
   if(view==='trash')where='m.owner=? AND m.deleted IS NOT NULL';
   const album=url.searchParams.get('album');if(album){where+=' AND m.album=?';args.push(album)}
   return json({media:await all(`SELECT m.*,u.name AS owner_name,a.name AS album_name,(SELECT count(*) FROM shares s WHERE s.media=m.id) AS shared_count FROM media m JOIN users u ON u.id=m.owner LEFT JOIN albums a ON a.id=m.album WHERE ${where} AND m.status='ready' ORDER BY m.created DESC LIMIT 100 OFFSET ?`,...args,offset),stats:await one("SELECT count(*) AS count,COALESCE(sum(size),0) AS bytes FROM media WHERE owner=? AND status='ready' AND deleted IS NULL",u.id)});
@@ -187,7 +200,7 @@ async function route(r:Request):Promise<Response>{
    if(method==='GET'){if(m.deleted||m.status!=='ready')fail('Unavailable.',404);const obj=await bucket().get(m.object_key+'.thumb');if(!obj)fail('Thumbnail unavailable.',404);return new Response(obj.body,{headers:{'Content-Type':'image/jpeg','Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'}})}
   }
   if(p[2]==='shares'){
-   if(m.owner!==u.id&&u.role!=='owner')fail('Only the uploader or owner can manage sharing.',403);
+   if(m.owner!==u.id&&u.role!=='owner')fail('Only the uploader or primary admin can manage sharing.',403);
    if(method==='GET')return json({recipients:(await all('SELECT recipient FROM shares WHERE media=?',mid)).map(x=>x.recipient)});
    if(method==='POST'){const b=await body(r);if(!Array.isArray(b.recipients)||b.recipients.length>200)fail('Choose family members.');const recipients=[...new Set(b.recipients)] as string[];for(const x of recipients)if(!await one('SELECT id FROM users WHERE id=? AND active=1',x))fail('Member unavailable.');await db().batch([stmt('DELETE FROM shares WHERE media=?',mid),...recipients.filter(x=>x!==m.owner).map(x=>stmt('INSERT INTO shares(media,recipient) VALUES(?,?)',mid,x))]);return json({ok:true})}
   }
