@@ -1,4 +1,5 @@
 import { env } from 'cloudflare:workers';
+import { RECOVERY_QUESTIONS,normalizeAnswer } from './recovery-questions';
 const CHUNK=8*1024*1024;
 const db=()=>{if(!env.DB)throw new Error('Database unavailable');return env.DB};
 const bucket=()=>{if(!env.BUCKET)throw new Error('Storage unavailable');return env.BUCKET};
@@ -24,6 +25,16 @@ async function session(u:any){const token=hex(crypto.getRandomValues(new Uint8Ar
 async function access(u:any,mid:string,write=false){const m=await one('SELECT * FROM media WHERE id=?',mid);if(!m)fail('Media not found.',404);if(m.owner!==u.id&&u.role!=='owner'&&(write||m.deleted||m.status!=='ready'||!await one('SELECT media FROM shares WHERE media=? AND recipient=?',mid,u.id)))fail('Media not found.',404);return m}
 function admin(u:any){if(!['owner','admin'].includes(u.role))fail('Account management access required.',403)}
 function manage(u:any,t:any){admin(u);if(!t)fail('Member not found',404);if(t.role==='owner'||(u.role==='admin'&&t.role!=='member'))fail('Only the owner can manage this account.',403)}
+function recoveryAnswers(value:any):{question:string,answer:string}[]{
+ if(!Array.isArray(value)||value.length!==3)fail('Choose three different recovery questions and answer each one.');
+ const answers=value.map(a=>{
+  if(!a||!RECOVERY_QUESTIONS.some(q=>q.id===a.question)||typeof a.answer!=='string'||a.answer.length>128)fail('Choose a valid question and an answer of 3–128 characters.');
+  const answer=normalizeAnswer(a.answer);if(answer.length<3)fail('Use answers with at least 3 characters.');
+  return {question:a.question as string,answer};
+ });
+ if(new Set(answers.map(a=>a.question)).size!==3)fail('Choose three different questions.');
+ return answers;
+}
 export async function handle(r:Request){try{return await route(r)}catch(e:any){if(!e.status)console.error('Vault request failed',e);return json({error:e.status?e.message:'The service is unavailable. Your files have not been marked verified. Please try again.'},e.status||503)}}
 async function route(r:Request):Promise<Response>{
  const url=new URL(r.url);const p=url.pathname.replace('/api/vault/','').split('/');const method=r.method;
@@ -40,32 +51,36 @@ async function route(r:Request):Promise<Response>{
   const b=await body(r),username=String(b.username||'').toLowerCase();await throttle('ip:'+r.headers.get('cf-connecting-ip'),60);await throttle('user:'+username,12);
   const u=await one('SELECT * FROM users WHERE username=? AND active=1',username);const input=typeof b.password==='string'&&b.password.length<=128?b.password:'';const hash=await pw(input,u?.password.split(':')[0]||'00000000000000000000000000000000');if(!u||!eq(hash,u.password))fail('Username or password is incorrect.',401);return session(u);
  }
- if(p[0]==='owner-reset'&&method==='POST'){
-  await throttle('owner-reset:'+r.headers.get('cf-connecting-ip'),10);
-  const b=await body(r),secret=(env as any).reset_secret;
-  const unavailable=()=>fail('The recovery key is invalid or has already been used.',403);
-  if(typeof secret!=='string'||secret.length<32||secret.length>256||typeof b.key!=='string'||b.key.length>256)unavailable();
-  const fingerprint=await sha(encode(secret));
-  if(!eq(fingerprint,await sha(encode(b.key))))unavailable();
-  const usedKey='owner_reset_used:'+fingerprint;
-  if(await one('SELECT key FROM settings WHERE key=?',usedKey))unavailable();
-  const owner=await one("SELECT * FROM users WHERE role='owner' LIMIT 1");
-  if(!owner)unavailable();
-  const next=password(b.password);
-  if(next!==b.confirm)fail('The new passwords do not match.');
-  if(eq(next,secret))fail('Choose a password different from the recovery key.');
-  const hashed=await pw(next);
-  try{
-   // The unique consumed-key insert and password/session changes commit together.
-   // A concurrent request with the same key rolls back its entire batch.
-   await db().batch([
-    stmt('INSERT INTO settings(key,value) VALUES(?,?)',usedKey,String(now())),
-    stmt('UPDATE users SET password=?,must_change=0,active=1 WHERE id=?',hashed,owner.id),
-    stmt('DELETE FROM sessions WHERE user_id=?',owner.id),
-    stmt('DELETE FROM limits WHERE key=?','user:'+owner.username)
-   ]);
-  }catch(e){if(await one('SELECT key FROM settings WHERE key=?',usedKey))unavailable();throw e}
-  return json({ok:true,username:owner.username});
+ // The former Cloudflare-secret recovery endpoint is intentionally retired.
+ if(p[0]==='owner-reset')fail('Not found.',404);
+ if(p[0]==='forgot-password'&&method==='POST'){
+  await throttle('recovery-ip:'+r.headers.get('cf-connecting-ip'),15);
+  const b=await body(r),username=String(b?.username||'').trim().toLowerCase().slice(0,40);
+  await throttle('recovery-user:'+username,5);
+  const invalid=()=>fail('Unable to reset this account. Check your username, questions and answers, or ask your family admin.',400);
+  const input=recoveryAnswers(b?.answers);
+  const account=await one('SELECT u.*,s.value AS recovery FROM users u LEFT JOIN settings s ON s.key=?||u.id WHERE u.username=? AND u.active=1 AND u.must_change=0','recovery:',username);
+  const saved=account?.recovery?JSON.parse(account.recovery):null;
+  let valid=!!saved;
+  // Always check all three answers, including dummy hashes for unknown accounts.
+  for(const answer of input){
+   const stored=saved?.answers.find((a:any)=>a.question===answer.question);
+   const hash=await pw(answer.answer,stored?.hash.split(':')[0]||'00000000000000000000000000000000');
+   if(!stored||!eq(hash,stored.hash))valid=false;
+  }
+  if(!valid)invalid();
+  const next=password(b.password);if(next!==b.confirm)fail('The new passwords do not match.');
+  const hashed=await pw(next),key='recovery:'+account.id;
+  // Each successful reset changes the recovery version. Stale/concurrent requests
+  // and credentials changed by an administrator cannot overwrite newer credentials.
+  const result=await db().batch([
+   stmt('UPDATE users SET password=?,must_change=0 WHERE id=? AND password=? AND active=1 AND must_change=0 AND EXISTS(SELECT 1 FROM settings WHERE key=? AND value=?)',hashed,account.id,account.password,key,account.recovery),
+   stmt('DELETE FROM sessions WHERE user_id=? AND EXISTS(SELECT 1 FROM users WHERE id=? AND password=?)',account.id,account.id,hashed),
+   stmt('UPDATE settings SET value=? WHERE key=? AND value=? AND EXISTS(SELECT 1 FROM users WHERE id=? AND password=?)',JSON.stringify({...saved,version:id()}),key,account.recovery,account.id,hashed),
+   stmt('DELETE FROM limits WHERE key=? AND EXISTS(SELECT 1 FROM users WHERE id=? AND password=?)','user:'+account.username,account.id,hashed)
+  ]);
+  if(!result[0].meta.changes)invalid();
+  return json({ok:true});
  }
  const u=await user(r);
  const expectedUser=r.headers.get('x-vault-user');if(expectedUser&&expectedUser!==u.id)return json({error:'The signed-in account changed in another tab. Please sign in with the account you want to use.',code:'SESSION_CHANGED'},409);
@@ -73,12 +88,39 @@ async function route(r:Request):Promise<Response>{
  if(p[0]==='logout'&&method==='POST'){const t=authToken(r)||'';await stmt('DELETE FROM sessions WHERE token=?',await sha(encode(t))).run();return json({ok:true},200,{'Set-Cookie':'auth=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0'})}
  if(p[0]==='password'&&method==='POST'){const b=await body(r);await throttle('password:'+u.id,12);if(!eq(await pw(String(b.current||''),u.password.split(':')[0]),u.password))fail('Current password is incorrect.');const nextPassword=await pw(password(b.password));await db().batch([stmt('UPDATE users SET password=?,must_change=0 WHERE id=?',nextPassword,u.id),stmt('DELETE FROM sessions WHERE user_id=?',u.id)]);return session({...u,password:nextPassword,must_change:0})}
  if(u.must_change)fail('Change your temporary password before continuing.',403);
+ if(p[0]==='account'){
+  if(method==='GET'){
+   const saved=await one('SELECT value FROM settings WHERE key=?','recovery:'+u.id);
+   return json({user:profile(u),recoveryQuestions:saved?JSON.parse(saved.value).answers.map((a:any)=>a.question):[]});
+  }
+  const b=await body(r);
+  if(p[1]==='profile'&&method==='POST'){
+   const name=typeof b.name==='string'?b.name.trim():'';
+   if(!name||name.length>80)fail('Use a display name with 1–80 characters.');
+   await stmt('UPDATE users SET name=? WHERE id=?',name,u.id).run();
+   return json({user:profile({...u,name})});
+  }
+  if(p[1]==='recovery'&&(method==='POST'||method==='DELETE')){
+   await throttle('recovery-settings:'+u.id,10);
+   if(typeof b.current!=='string'||b.current.length>128||!eq(await pw(b.current,u.password.split(':')[0]),u.password))fail('Current password is incorrect.');
+   if(method==='DELETE'){
+    await stmt('DELETE FROM settings WHERE key=? AND EXISTS(SELECT 1 FROM users WHERE id=? AND password=?)','recovery:'+u.id,u.id,u.password).run();
+   }else{
+    const answers=recoveryAnswers(b.answers);
+    const hashed=[];for(const a of answers)hashed.push({question:a.question,hash:await pw(a.answer)});
+    const result=await stmt('INSERT INTO settings(key,value) SELECT ?,? WHERE EXISTS(SELECT 1 FROM users WHERE id=? AND password=? AND active=1 AND must_change=0) ON CONFLICT(key) DO UPDATE SET value=excluded.value','recovery:'+u.id,JSON.stringify({version:id(),answers:hashed}),u.id,u.password).run();
+    if(!result.meta.changes)fail('Your account changed. Please sign in again.',401);
+   }
+   return json({ok:true});
+  }
+  fail('Not found.',404);
+ }
  if(p[0]==='members'){
   if(method==='GET')return json({members:await all("SELECT id,username,name,role,active FROM users WHERE (active=1 OR ?=1) AND (role<>'owner' OR ?=1) ORDER BY name COLLATE NOCASE",u.role==='owner'||u.role==='admin'?1:0,u.role==='owner'?1:0)});
   admin(u);const b=await body(r);
   if(method==='POST'&&!p[1]){const username=String(b.username||'').toLowerCase();if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');const role=u.role==='owner'&&b.role==='admin'?'admin':'member';try{await stmt('INSERT INTO users(id,username,name,password,role,created) VALUES(?,?,?,?,?,?)',id(),username,String(b.name||username).trim().slice(0,80),await pw(password(b.password)),role,now()).run()}catch{fail('That username is already in use.',409)}return json({ok:true})}
   const t=await one('SELECT * FROM users WHERE id=?',p[1]);manage(u,t);
-  if(p[2]==='reset'&&method==='POST'){await db().batch([stmt('UPDATE users SET password=?,must_change=1 WHERE id=?',await pw(password(b.password)),t.id),stmt('DELETE FROM sessions WHERE user_id=?',t.id)]);return json({ok:true})}
+  if(p[2]==='reset'&&method==='POST'){await db().batch([stmt('UPDATE users SET password=?,must_change=1 WHERE id=?',await pw(password(b.password)),t.id),stmt('DELETE FROM sessions WHERE user_id=?',t.id),stmt('DELETE FROM settings WHERE key=?','recovery:'+t.id)]);return json({ok:true})}
   if(p[2]==='access'&&method==='POST'){await db().batch([stmt('UPDATE users SET active=? WHERE id=?',b.active?1:0,t.id),stmt('DELETE FROM sessions WHERE user_id=?',t.id)]);return json({ok:true})}
  }
  if(p[0]==='albums'){

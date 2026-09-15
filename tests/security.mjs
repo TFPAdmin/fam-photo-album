@@ -60,48 +60,72 @@ try{
  r=await req('password',{cookie:resetCookie,method:'POST',data:{current:'new-temporary-password',password:'bob-final-password'}});const finalCookie=cookie(r);assert.ok(finalCookie&&finalCookie!==resetCookie);await req('me',{cookie:finalCookie});await req('login',{method:'POST',data:{username:'bob',password:'bob-final-password'}});await req('media',{cookie:finalCookie});
  await req('members/'+b.id+'/reset',{cookie:owner,method:'POST',data:{password:'owner-reset-password'}});await req('me',{cookie:owner});await req('me',{cookie:resetCookie,expect:401});
  await req('members/'+a.id+'/access',{cookie:ad.cookie,method:'POST',data:{active:false}});await req('me',{cookie:a.cookie,expect:401});
- // Owner recovery: fail closed, transactional one-time use, session revocation and key rotation.
- const recover=(key,password='recovered-owner-password',extra={})=>req('owner-reset',{method:'POST',data:{key,password,confirm:password},headers:{'cf-connecting-ip':'192.0.2.50'},...extra});
- const memberBefore=await db.prepare('SELECT password FROM users WHERE id=?').bind(b.id).first();
- await recover('wrong-recovery-key-value-32-characters','recovered-owner-password',{expect:403});
- await recover(recoverySecret,'short',{expect:400});
- await recover(recoverySecret,recoverySecret,{expect:400});
- await recover(recoverySecret,'recovered-owner-password',{data:{key:recoverySecret,password:'recovered-owner-password',confirm:'different-password'},expect:400});
- await recover(recoverySecret,'recovered-owner-password',{headers:{origin:'https://evil.test'},expect:403});
- const usedKey='owner_reset_used:'+createHash('sha256').update(recoverySecret).digest('hex');
- // An injected storage failure must roll back consumption as well as the password.
- await db.prepare("CREATE TRIGGER fail_recovery BEFORE UPDATE ON users WHEN OLD.role='owner' BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END").run();
- await recover(recoverySecret,'recovered-owner-password',{expect:503});
- assert.equal(await db.prepare('SELECT key FROM settings WHERE key=?').bind(usedKey).first(),null);
- await req('me',{cookie:owner});
- await db.prepare('DROP TRIGGER fail_recovery').run();
- // Two valid simultaneous submissions: exactly one can commit.
- const attempts=['recovered-owner-password','another-owner-password'];
- const results=await Promise.all(attempts.map(password=>mf.dispatchFetch(origin+'/api/vault/owner-reset',{method:'POST',headers:{origin,'content-type':'application/json','cf-connecting-ip':'192.0.2.51'},body:JSON.stringify({key:recoverySecret,password,confirm:password})})));
- assert.deepEqual(results.map(r=>r.status).sort(),[200,403]);checks+=2;
- const winningPassword=attempts[results.findIndex(r=>r.status===200)];
- assert.equal((await results.find(r=>r.status===200).json()).username,'owner');
- await req('me',{cookie:owner,expect:401});
- await req('login',{method:'POST',data:{username:'owner',password:'owner-password-long'},expect:401});
- owner=cookie(await req('login',{method:'POST',data:{username:'owner',password:winningPassword}}));
- assert.equal((await data(await req('me',{cookie:owner}))).user.mustChange,false);
- await recover(recoverySecret,'should-not-be-applied-password',{expect:403});
- assert.deepEqual(await db.prepare('SELECT password FROM users WHERE id=?').bind(b.id).first(),memberBefore);
- await req('me',{cookie:ad.cookie});
- // Empty/short configuration fails closed. A new key enables another reset.
- for(const secret of [undefined,'too-short']){
-  await mf.setOptions({...options,bindings:{SETUP_KEY:'test-setup-key',...(secret?{reset_secret:secret}:{})}});
-  await recover(secret||recoverySecret,'should-not-be-applied-password',{expect:403,headers:{'cf-connecting-ip':'192.0.2.52'}});
+ // Account Center and all-role recovery.
+ const answers=[{question:'birthday',answer:'1980-03-05'},{question:'wedding',answer:'  Secret   Garden '},{question:'oldest_child',answer:'Bluebird'}];
+ const recovery=(username,submitted=answers,extra={})=>req('forgot-password',{method:'POST',data:{username,answers:submitted,password:'recovered-password-long',confirm:'recovered-password-long'},headers:{'cf-connecting-ip':'192.0.2.50'},...extra});
+ const clearRecoveryLimits=()=>db.prepare("DELETE FROM limits WHERE key LIKE 'recovery-%'").run();
+ await req('owner-reset',{method:'POST',data:{key:recoverySecret,password:'unused-password',confirm:'unused-password'},expect:404});
+ await req('account',{expect:401});
+ await req('members/'+a.id+'/access',{cookie:owner,method:'POST',data:{active:true}});
+ a.cookie=cookie(await req('login',{method:'POST',data:{username:'alice',password:'alice-updated-password'}}));
+ let profileResult=await data(await req('account/profile',{cookie:a.cookie,method:'POST',data:{name:'Alice Example',id:ownerId,role:'owner'}}));
+ assert.equal(profileResult.user.id,a.id);assert.equal(profileResult.user.role,'member');assert.equal(profileResult.user.name,'Alice Example');
+ assert.equal((await data(await req('me',{cookie:owner}))).user.name,'Owner');
+ await req('account/profile',{cookie:a.cookie,method:'POST',data:{name:'   '},expect:400});
+ await req('account/recovery',{cookie:a.cookie,method:'POST',data:{current:'wrong',answers},expect:400});
+ await req('account/recovery',{cookie:a.cookie,method:'POST',data:{current:'alice-updated-password',answers:[answers[0],answers[0],answers[2]]},expect:400});
+ await req('account/recovery',{cookie:a.cookie,method:'POST',headers:{origin:'https://evil.test'},data:{current:'alice-updated-password',answers},expect:403});
+ const peopleToRecover=[{username:'owner',id:ownerId,cookie:owner,password:'owner-password-long'},{username:'admin',...ad,password:'admin-permanent-password'},{username:'alice',...a,password:'alice-updated-password'}];
+ for(const person of peopleToRecover){
+  assert.deepEqual((await data(await req('account',{cookie:person.cookie}))).recoveryQuestions,[]);
+  await req('account/recovery',{cookie:person.cookie,method:'POST',data:{current:person.password,answers,user_id:b.id}});
+  const account=await data(await req('account',{cookie:person.cookie}));assert.deepEqual(account.recoveryQuestions,answers.map(a=>a.question));assert.ok(!JSON.stringify(account).includes('Bluebird'));
+  const record=await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+person.id).first();assert.ok(!record.value.includes('1980-03-05'));assert.ok(!record.value.includes('Bluebird'));
  }
- const nextKey='another-test-recovery-key-at-least-32-characters';
- await mf.setOptions({...options,bindings:{SETUP_KEY:'test-setup-key',reset_secret:nextKey}});
- await (await mf.getD1Database('DB')).prepare('UPDATE users SET active=0 WHERE id=?').bind(ownerId).run();
- await recover(nextKey,'final-owner-password',{headers:{'cf-connecting-ip':'192.0.2.53'}});
- const recoveredOwner=(await data(await req('login',{method:'POST',data:{username:'owner',password:'final-owner-password'}}))).user;
- assert.equal(recoveredOwner.id,ownerId);assert.equal(recoveredOwner.active,true);
- // Redeploying an older secret cannot make it usable again.
- await mf.setOptions({...options,bindings:{SETUP_KEY:'test-setup-key',reset_secret:recoverySecret}});
- await recover(recoverySecret,'should-not-be-applied-password',{expect:403,headers:{'cf-connecting-ip':'192.0.2.54'}});
- for(let i=0;i<11;i++)await recover('incorrect-key','unused-password',{expect:i<10?403:429,headers:{'cf-connecting-ip':'192.0.2.55'}});
- console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset, owner recovery/replay/concurrency/rollback, and account disable.`);
+ assert.equal(await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+b.id).first(),null);
+ const badAnswers=answers.map((a,i)=>i===1?{...a,answer:'Incorrect'}:a);
+ const unknown=await data(await recovery('nobody',answers,{expect:400}));
+ assert.deepEqual(await data(await recovery('bob',answers,{expect:400})),unknown);
+ assert.deepEqual(await data(await recovery('owner',badAnswers,{expect:400})),unknown);
+ await recovery('owner',answers,{headers:{origin:'https://evil.test'},expect:403});
+ await recovery('owner',answers,{data:{username:'owner',answers,password:'new-password-long',confirm:'different-password'},expect:400});
+ await clearRecoveryLimits();
+ // Simulated storage failure must preserve the original password and sessions.
+ await db.prepare("CREATE TRIGGER fail_recovery BEFORE UPDATE ON users WHEN OLD.role='owner' BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END").run();
+ await recovery('owner',answers,{expect:503});await req('me',{cookie:owner});
+ await db.prepare('DROP TRIGGER fail_recovery').run();
+ await db.prepare('INSERT INTO limits(key,count,reset) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET count=excluded.count,reset=excluded.reset').bind('user:owner',12,Date.now()+900000).run();
+ await req('login',{method:'POST',data:{username:'owner',password:'owner-password-long'},expect:429});
+ for(const person of peopleToRecover){
+  // Question order and case/extra spaces do not change the answers.
+  const normalized=[...answers].reverse().map(a=>({...a,answer:a.answer.toUpperCase()}));
+  await recovery(person.username,normalized);
+  await req('me',{cookie:person.cookie,expect:401});
+  await req('login',{method:'POST',data:{username:person.username,password:person.password},expect:401});
+  person.cookie=cookie(await req('login',{method:'POST',data:{username:person.username,password:'recovered-password-long'}}));
+  assert.equal((await data(await req('me',{cookie:person.cookie}))).user.mustChange,false);
+ }
+ owner=peopleToRecover[0].cookie;ad.cookie=peopleToRecover[1].cookie;a.cookie=peopleToRecover[2].cookie;
+ // Disabled accounts cannot be re-enabled by recovery, even with correct answers.
+ await req('members/'+a.id+'/access',{cookie:owner,method:'POST',data:{active:false}});
+ assert.deepEqual(await data(await recovery('alice',answers,{expect:400})),unknown);
+ await req('members/'+a.id+'/access',{cookie:owner,method:'POST',data:{active:true}});
+ a.cookie=cookie(await req('login',{method:'POST',data:{username:'alice',password:'recovered-password-long'}}));
+ // Removing/replacing questions requires the account's current password.
+ await req('account/recovery',{cookie:a.cookie,method:'DELETE',data:{current:'wrong'},expect:400});
+ await req('account/recovery',{cookie:a.cookie,method:'DELETE',data:{current:'recovered-password-long'}});
+ assert.deepEqual((await data(await req('account',{cookie:a.cookie}))).recoveryQuestions,[]);
+ await recovery('alice',answers,{expect:400});
+ await req('account/recovery',{cookie:a.cookie,method:'POST',data:{current:'recovered-password-long',answers}});
+ // Admin password reset removes the old recovery answers so they cannot bypass it.
+ await req('members/'+a.id+'/reset',{cookie:ad.cookie,method:'POST',data:{password:'admin-issued-temporary'}});
+ assert.equal(await db.prepare('SELECT value FROM settings WHERE key=?').bind('recovery:'+a.id).first(),null);
+ await clearRecoveryLimits();await recovery('alice',answers,{expect:400});
+ const temp=cookie(await req('login',{method:'POST',data:{username:'alice',password:'admin-issued-temporary'}}));
+ await req('account/recovery',{cookie:temp,method:'POST',data:{current:'admin-issued-temporary',answers},expect:403});
+ // Answer checks are limited per username even when requests come from different IPs.
+ for(let i=0;i<6;i++)await recovery('rate-limited-account',badAnswers,{expect:i<5?400:429,headers:{'cf-connecting-ip':'192.0.2.'+(70+i)}});
+ // IP throttling also applies across different usernames.
+ for(let i=0;i<16;i++)await recovery('rate-account-'+i,badAnswers,{expect:i<15?400:429,headers:{'cf-connecting-ip':'192.0.2.99'}});
+ console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset, Account Center, all-role recovery, answer privacy, recovery removal, rate limits and rollback, and account disable.`);
 }finally{await mf.dispose()}
