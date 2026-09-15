@@ -42,7 +42,7 @@ After deployment, open the domain, enter `SETUP_KEY`, and create the owner usern
 - **Admin:** creates member/admin accounts, changes other accounts between Member and Admin, resets member passwords and enables/disables members. Does not automatically gain access to member media or manage primary admin credentials. Only the primary admin resets admin passwords or enables/disables admins.
 - **Member:** manages a private collection and albums. Selects individual family members who may view and download a file. Recipients cannot edit or re-share it through the app.
 - New-account and reset forms include **Require password change at next sign-in**, enabled by default. Admins/owners can uncheck it to allow the supplied password to be used directly. Changing your own password rotates the session cookie and revokes all previous sessions. Admin resets revoke the target member’s sessions while preserving the administrator’s session. Expired or changed accounts return the interface to sign-in rather than leaving stale account controls visible.
-- No public account registration or ChatGPT authentication. Login, password and setup attempts are rate-limited, and writes require the same request origin.
+- Public signup is off by default and can be enabled by the primary admin in Family accounts. No ChatGPT authentication. Login, password and setup attempts are rate-limited, and writes require the same request origin.
 
 ## Account Center and password recovery
 
@@ -77,3 +77,9 @@ Recently removed files remain recoverable and continue to use storage. Permanent
 - `npm run deploy`: apply migrations and publish the current build.
 
 No family media or test accounts are seeded into production. The optional WebMCP upload-panel helper is feature-detected; a supported WebMCP execution environment was unavailable for validation. Browser/device QA has not yet been performed.
+
+## Public signup
+
+In **Family accounts**, the primary admin can toggle **Public signup**. When enabled, the sign-in page shows **Create an account**, linking to `/?signup=1`. New accounts are always active Members with private collections; submitted role/access flags cannot elevate them. Signup requires a unique username, display name and confirmed password, and is rate-limited per IP. Switching it off hides the link and rejects server-side registrations, including forms already open. Existing accounts keep access. The login page refreshes signup availability on focus and every 15 seconds. No new secrets or migrations are required.
+
+All new passwords (setup, signup, account changes, recovery, and admin resets) require **8–128 characters**. Existing passwords remain valid. Expired sessions return to a clean sign-in screen; incorrect-login errors are still displayed.

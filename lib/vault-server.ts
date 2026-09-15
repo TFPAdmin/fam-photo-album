@@ -13,7 +13,7 @@ const encode=(s:string)=>new TextEncoder().encode(s);
 function fail(message:string,status=400):never{throw Object.assign(new Error(message),{status})}
 function eq(a:string,b:string){if(a.length!==b.length)return false;let d=0;for(let i=0;i<a.length;i++)d|=a.charCodeAt(i)^b.charCodeAt(i);return d===0}
 async function pw(p:string,salt=hex(crypto.getRandomValues(new Uint8Array(16)).buffer)){const k=await crypto.subtle.importKey('raw',encode(p), 'PBKDF2',false,['deriveBits']);return salt+':'+hex(await crypto.subtle.deriveBits({name:'PBKDF2',salt:encode(salt),iterations:100000,hash:'SHA-256'},k,256))}
-function password(p:any){if(typeof p!=='string'||p.length<12||p.length>128)fail('Use a password with 12–128 characters.');return p}
+function password(p:any){if(typeof p!=='string'||p.length<8||p.length>128)fail('Use a password with 8–128 characters.');return p}
 function forcePasswordChange(value:any){if(value!==undefined&&typeof value!=='boolean')fail('Choose whether a password change is required.');return value===false?0:1}
 const profile=(u:any)=>({id:u.id,username:u.username,name:u.name,role:u.role,mustChange:!!u.must_change,active:!!u.active});
 function json(x:any,status=200,headers:Record<string,string>={}){return Response.json(x,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}})}
@@ -40,7 +40,24 @@ export async function handle(r:Request){try{return await route(r)}catch(e:any){i
 async function route(r:Request):Promise<Response>{
  const url=new URL(r.url);const p=url.pathname.replace('/api/vault/','').split('/');const method=r.method;
  if(method!=='GET'&&r.headers.get('origin')!==url.origin)fail('Invalid request origin.',403);
- if(p[0]==='status'&&method==='GET')return json({needsSetup:!await one("SELECT id FROM users WHERE role='owner' LIMIT 1")});
+ if(p[0]==='status'&&method==='GET'){
+  const initialized=!!await one("SELECT id FROM users WHERE role='owner' LIMIT 1");
+  return json({needsSetup:!initialized,signupEnabled:initialized&&(await one("SELECT value FROM settings WHERE key='public_signup'"))?.value==='true'});
+ }
+ if(p[0]==='signup'&&method==='POST'){
+  await throttle('signup:'+r.headers.get('cf-connecting-ip'),5);
+  if((await one("SELECT value FROM settings WHERE key='public_signup'"))?.value!=='true')fail('Public signup is currently closed.',403);
+  const b=await body(r),username=typeof b?.username==='string'?b.username.trim().toLowerCase():'',name=typeof b?.name==='string'?b.name.trim():'';
+  if(!/^[a-z0-9_.-]{3,40}$/.test(username))fail('Use a username with 3–40 letters, numbers, periods, hyphens or underscores.');
+  if(!name||name.length>80)fail('Use a name with 1–80 characters.');
+  const next=password(b.password);if(next!==b.confirm)fail('The new passwords do not match.');
+  const u={id:id(),username,name,password:await pw(next),role:'member',must_change:0,active:1};
+  try{
+   const result=await stmt("INSERT INTO users(id,username,name,password,role,must_change,active,created) SELECT ?,?,?,?,'member',0,1,? WHERE EXISTS(SELECT 1 FROM settings WHERE key='public_signup' AND value='true') AND EXISTS(SELECT 1 FROM users WHERE role='owner')",u.id,username,name,u.password,now()).run();
+   if(!result.meta.changes)fail('Public signup is currently closed.',403);
+  }catch(e){if(await one('SELECT id FROM users WHERE username=?',username))fail('That username is unavailable.',409);throw e}
+  return session(u);
+ }
  if(p[0]==='setup'&&method==='POST'){
   await throttle('setup:'+r.headers.get('cf-connecting-ip'),10);const b=await body(r);const key=(env as any).SETUP_KEY;
   if(!key||typeof b.key!=='string'||!eq(key,b.key))fail('The setup key is incorrect.',403);
@@ -89,6 +106,16 @@ async function route(r:Request):Promise<Response>{
  if(p[0]==='logout'&&method==='POST'){const t=authToken(r)||'';await stmt('DELETE FROM sessions WHERE token=?',await sha(encode(t))).run();return json({ok:true},200,{'Set-Cookie':'auth=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0'})}
  if(p[0]==='password'&&method==='POST'){const b=await body(r);await throttle('password:'+u.id,12);if(!eq(await pw(String(b.current||''),u.password.split(':')[0]),u.password))fail('Current password is incorrect.');const nextPassword=await pw(password(b.password));await db().batch([stmt('UPDATE users SET password=?,must_change=0 WHERE id=?',nextPassword,u.id),stmt('DELETE FROM sessions WHERE user_id=?',u.id)]);return session({...u,password:nextPassword,must_change:0})}
  if(u.must_change)fail('Change your temporary password before continuing.',403);
+ if(p[0]==='signup-settings'){
+  if(u.role!=='owner')fail('Primary admin access required.',403);
+  if(method==='GET')return json({enabled:(await one("SELECT value FROM settings WHERE key='public_signup'"))?.value==='true'});
+  if(method==='POST'){
+   const b=await body(r);if(typeof b?.enabled!=='boolean')fail('Choose whether public signup is enabled.');
+   await stmt("INSERT INTO settings(key,value) VALUES('public_signup',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",b.enabled?'true':'false').run();
+   return json({enabled:b.enabled});
+  }
+  fail('Not found.',404);
+ }
  if(p[0]==='account'){
   if(method==='GET'){
    const saved=await one('SELECT value FROM settings WHERE key=?','recovery:'+u.id);

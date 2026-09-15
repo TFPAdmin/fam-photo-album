@@ -20,8 +20,8 @@ export function PasswordRecovery({api}:{api:Api}){
  <form onSubmit={async e=>{e.preventDefault();const form=e.currentTarget,d=new FormData(form);setBusy(true);setError('');try{await api('forgot-password',{username:d.get('username'),answers:questionData(d),password:d.get('password'),confirm:d.get('confirm')});form.reset();setDone(true)}catch(e:any){setError(e.message)}finally{setBusy(false)}}}>
  <fieldset disabled={busy} className="form-fields"><label>Username<Input name="username" required maxLength={40} autoComplete="username" autoCapitalize="none"/></label>
  <Questions/>
- <label>New password<Input name="password" type="password" required minLength={12} maxLength={128} autoComplete="new-password"/></label>
- <label>Confirm new password<Input name="confirm" type="password" required minLength={12} maxLength={128} autoComplete="new-password"/></label>
+ <label>New password<Input name="password" type="password" required minLength={8} maxLength={128} autoComplete="new-password"/></label>
+ <label>Confirm new password<Input name="confirm" type="password" required minLength={8} maxLength={128} autoComplete="new-password"/></label>
  <Button type="submit">{busy?'Checking…':'Reset password'}</Button></fieldset></form>
  {error&&<p role="alert" className="error">{error}</p>}
  <p>If you haven’t saved questions or can’t remember your answers, ask your family admin for a temporary password.</p><Button variant="ghost" asChild><a href="/">Back to sign in</a></Button></>}</section>;

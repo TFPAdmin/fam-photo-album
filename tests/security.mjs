@@ -195,5 +195,49 @@ try{
  await changeRole(ad.id,'member',owner);await req('me',{cookie:ad.cookie,expect:401});
  assert.equal((await data(await req('me',{cookie:owner}))).user.role,'owner');
  await req('media/'+upload+'/file',{cookie:owner});
+ // Public signup is controlled only by the primary admin and defaults closed.
+ assert.equal((await data(await req('status'))).signupEnabled,false);
+ const publicAdmin=cookie(await req('login',{method:'POST',data:{username:'new-admin',password:'new-admin-password'}}));
+ await req('signup-settings',{expect:401});await req('signup-settings',{cookie:publicAdmin,expect:403});
+ await req('signup-settings',{cookie:publicAdmin,method:'POST',data:{enabled:true},expect:403});
+ await req('signup-settings',{cookie:directCookie,method:'POST',data:{enabled:true},expect:403});
+ assert.equal((await data(await req('signup-settings',{cookie:owner}))).enabled,false);
+ let signupIp=110;
+ const signup=(body,expect=200,headers={})=>req('signup',{method:'POST',data:body,expect,headers:{'cf-connecting-ip':'192.0.2.'+(signupIp++),...headers}});
+ const applicant={name:'Public Member',username:'public-member',password:'12345678',confirm:'12345678'};
+ await signup(applicant,403);
+ await req('signup-settings',{cookie:owner,method:'POST',data:{enabled:'true'},expect:400});
+ await req('signup-settings',{cookie:owner,method:'POST',data:{enabled:true},headers:{origin:'https://evil.test'},expect:403});
+ await req('signup-settings',{cookie:owner,method:'POST',data:{enabled:true}});
+ assert.equal((await data(await req('status'))).signupEnabled,true);
+ await signup({...applicant,password:'1234567',confirm:'1234567'},400);
+ await signup({...applicant,confirm:'different'},400);
+ await signup({...applicant,username:'bad username'},400);
+ await signup(applicant,403,{origin:'https://evil.test'});
+ const registered=await signup({...applicant,role:'owner',mustChange:true,active:false}),registeredCookie=cookie(registered),registeredUser=(await data(registered)).user;
+ assert.equal(registeredUser.role,'member');assert.equal(registeredUser.mustChange,false);assert.equal(registeredUser.active,true);
+ assert.equal((await data(await req('media',{cookie:registeredCookie}))).media.length,0);
+ await req('media?view=family',{cookie:registeredCookie,expect:403});
+ await req('media/'+upload+'/file',{cookie:registeredCookie,expect:404});
+ await signup({...applicant,username:'PUBLIC-MEMBER'},409);
+ assert.ok(!(await data(await req('members',{cookie:registeredCookie}))).members.some(m=>m.role==='owner'));
+ // The 8-character minimum also applies to personal changes, admin resets and recovery.
+ await req('password',{cookie:registeredCookie,method:'POST',data:{current:'12345678',password:'1234567'},expect:400});
+ let changed=await req('password',{cookie:registeredCookie,method:'POST',data:{current:'12345678',password:'abcdefgh'}}),changedCookie=cookie(changed);
+ await req('account/recovery',{cookie:changedCookie,method:'POST',data:{current:'abcdefgh',answers}});
+ await req('forgot-password',{method:'POST',headers:{'cf-connecting-ip':'192.0.2.180'},data:{username:'public-member',answers,password:'87654321',confirm:'87654321'}});
+ await req('login',{method:'POST',data:{username:'public-member',password:'87654321'}});
+ await req('members/'+registeredUser.id+'/reset',{cookie:owner,method:'POST',data:{password:'abcd1234',mustChange:false}});
+ await req('login',{method:'POST',data:{username:'public-member',password:'abcd1234'}});
+ await req('members',{cookie:owner,method:'POST',data:{username:'eight-char',name:'Eight',password:'abcd1234',mustChange:false}});
+ // Closing signup rejects direct requests from stale forms but preserves created users.
+ await req('signup-settings',{cookie:owner,method:'POST',data:{enabled:false}});
+ assert.equal((await data(await req('status'))).signupEnabled,false);
+ await signup({...applicant,username:'closed-form'},403);
+ await req('login',{method:'POST',data:{username:'public-member',password:'abcd1234'}});
+ assert.equal(await db.prepare('SELECT id FROM users WHERE username=?').bind('closed-form').first(),null);
+ await req('signup-settings',{cookie:owner,method:'POST',data:{enabled:true}});
+ for(let i=0;i<6;i++)await signup({...applicant,username:'invalid username'},i<5?400:429,{'cf-connecting-ip':'192.0.2.199'});
+ await req('signup-settings',{cookie:owner,method:'POST',data:{enabled:false}});
  console.log(`PASS: ${checks} API checks covering owner setup, roles, CSRF, multi-part upload, read-back checksums, private access, range download, sharing/revocation, trash/restore, password reset, Account Center, all-role recovery, answer privacy, recovery removal, rate limits and rollback, and account disable.`);
 }finally{await mf.dispose()}
